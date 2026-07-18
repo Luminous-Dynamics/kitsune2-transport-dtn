@@ -255,9 +255,12 @@ async fn kitsune2_message_survives_receiver_outage() {
     );
     println!(
         "PROOF: a Kitsune2 send_space_notify() call issued while the peer's \
-         daemon did not exist yet was automatically, correctly delivered once \
-         the peer came online -- real disruption tolerance at the Kitsune2 \
-         transport layer, not just raw dtn7 bundles."
+         daemon did not exist yet was automatically, correctly delivered \
+         byte-identical once the peer came online and its endpoint was \
+         registered -- one specific, narrow disruption case (peer absent at \
+         send time), not a general claim about partitions, restarts, \
+         duplicates, or reordering. See README.md 'Not yet tested' for what \
+         remains open."
     );
 
     let _ = node2_daemon.start_kill();

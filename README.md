@@ -15,6 +15,23 @@ still exchange Kitsune2 traffic — the bundle is held and forwarded whenever
 the recipient becomes reachable, with no live connection required at send
 time.
 
+**What this actually demonstrates, precisely**: a Kitsune2 message can be
+delivered byte-identically through a real BPv7/dtn7-rs store-and-forward
+path when the two peers are not continuously connected. It does **not**
+yet demonstrate long-duration partitions, process restarts with persisted
+state, duplicate delivery, bundle expiry under load, reordering, or
+reconciliation after divergent application state — see "Not yet tested"
+below for the honest list.
+
+> **Invariant, load-bearing, not optional**: a receiving endpoint must be
+> registered (`DtnTransportFactory::create()` completing, which calls
+> dtn7's `/register`) *before* the peer relationship that makes it
+> reachable is established. This adapter does **not** buffer or retry
+> bundles addressed to an endpoint that doesn't exist yet — they are
+> silently dropped by the daemon with no observable error. See "A real bug
+> found" below for how this was discovered, and "Delivery semantics" for
+> the full guarantee (or lack of one).
+
 ## Why this is possible at all
 
 Reading Holochain's conductor config surface first suggested this wasn't
@@ -46,6 +63,85 @@ segment of a nominal `ws://` URL that is never actually dialed.
 - `DtnTransportFactory::create()` self-registers the local DTN endpoint
   before returning, so the transport is ready to receive as soon as it's
   constructed.
+
+## Delivery semantics
+
+Stated explicitly rather than left implicit, since DTN + polling raises
+questions a normal live-socket transport doesn't:
+
+- **At-most-once to the Kitsune2 handler, verified in this crate's own
+  code, not assumed.** `GET /endpoint` *pops* the next bundle from dtn7's
+  application-agent queue as part of that same HTTP call (confirmed by
+  reading dtn7-rs's `endpoint()` handler directly) — the bundle is already
+  gone from the daemon before this crate even tries to decode it. If CBOR
+  decoding fails, if the payload block is missing, or if
+  `TxImpHnd::recv_data()` itself returns an error, **there is no retry and
+  no re-queueing**. The bundle is lost at that point, silently, with only
+  a `tracing::warn!` log line.
+- **Network-level duplicates are deduplicated by dtn7-rs itself**, verified
+  by reading `core::processing::receive()`: bundles are identified by their
+  real BPv7 bundle ID (source + creation timestamp + fragment info), and
+  `store_add_bundle_if_unknown()` drops (and counts in a `dups` stat) any
+  bundle whose ID has already been seen — so a retransmitted duplicate at
+  the daemon layer will not reach `/endpoint` twice. This crate does not
+  add any deduplication of its own on top; it relies entirely on dtn7-rs's.
+- **Ordering is not guaranteed.** Nothing in this transport or in dtn7-rs's
+  `/endpoint` pop order was verified to preserve send order across
+  reconnects or multiple in-flight bundles — untested, not claimed.
+- **Poller crash between pop and dispatch** would lose the bundle (it's
+  already removed from dtn7's queue). Not yet tested, but follows directly
+  from the pop-before-decode design above.
+
+## Peer/endpoint identity
+
+The Kitsune2 `Url` this transport reports for a node (`node_url()`) encodes
+exactly two things: the DTN node name (`dtnd -n <name>`) and this crate's
+fixed service name, as the last path segment of a nominal `ws://` URL. It
+does **not** encode any physical daemon address (host/port) — those are
+purely local config (`DtnConfig::web_port`) never exposed in the URL. This
+means the identity Kitsune2 sees is a stable *logical* DTN identity, not a
+transient network location — which is arguably the right property for an
+intermittently-connected system (reconnecting doesn't change who a peer
+*is*), but it also means this transport cannot currently distinguish "the
+same DTN node, restarted" from "the same DTN node, still running" — both
+present the identical Kitsune2 `Url`.
+
+## Lifecycle (the bug, illustrated)
+
+Before the fix — node1 already knows how to reach node2 (static peer) the
+moment node2's daemon process starts, which is faster than this crate's
+own registration call:
+
+```text
+node1                    dtn7 node1              dtn7 node2         node2 (this crate)
+  |                          |                        |                    |
+  |                          |                    (starts, MTCP up)        |
+  | send_space_notify() ---->|                        |                    |
+  |                          | --- bundle, real MTCP send --------------->  |
+  |                          |                        | no "kitsune2"      |
+  |                          |                        | endpoint yet:      |
+  |                          |                        | dropped, silent    |
+  |                          |                        |                    |
+  |                          |                        |     factory2.create()
+  |                          |                        |<---- /register ----|
+  |                          |                        |   (too late)       |
+```
+
+After the fix — registration happens first, peer relationship is added
+only afterward:
+
+```text
+node1                    dtn7 node1              dtn7 node2         node2 (this crate)
+  |                          |                        |                    |
+  |                          |                        |     factory2.create()
+  |                          |                        |<---- /register ----|
+  |                          |                        |  "kitsune2" exists |
+  | send_space_notify() ---->|                        |                    |
+  | /peers/add (node2) ----->|                        |                    |
+  |                          | --- bundle, real MTCP send --------------->  |
+  |                          |                        | delivers to        |
+  |                          |                        | "kitsune2" ---------> recv_data()
+```
 
 ## Honest limitations
 
@@ -121,6 +217,34 @@ DTN_BIN_DIR=/path/to/dtn7-rs/target/release \
 DTN_NODE2_WORKDIR=/path/to/a/fresh/empty/dir \
 cargo test --test integration kitsune2_message_survives_receiver_outage -- --nocapture
 ```
+
+## Not yet tested
+
+Listed explicitly so scope isn't implied by silence. None of these are
+started — a real backlog, not a to-do buried in prose:
+
+1. **Receiver registers late** (beyond the one race already found and
+   fixed) — is there any scenario where a late-arriving bundle *should* be
+   retained rather than dropped, and if so, at which layer?
+2. **Receiver process restarts** with dtn7's `-D sled` persistent backend —
+   do queued-but-undelivered bundles survive, and does Kitsune2-level
+   identity (the `Url`) remain stable across the restart?
+3. **Handler fails after retrieval** — confirmed above that there's no
+   retry; not yet exercised as an actual test.
+4. **Duplicate bundle delivery** at the Kitsune2 layer specifically (dtn7's
+   own dedup is verified; whether anything above it could still observe a
+   duplicate is not).
+5. **Out-of-order delivery** across alternating connectivity.
+6. **Bundle expiry and bounded daemon storage under load** — this session's
+   broader DTN research separately found a real dtn7-rs issue in this area
+   (expired bundles bypass discard accounting/reporting —
+   [dtn7-rs#85](https://github.com/dtn7/dtn7-rs/issues/85)), not yet
+   re-tested through this Kitsune2 layer specifically.
+7. **Bidirectional simultaneous traffic**, both nodes sending and receiving
+   during a reconnect window.
+8. **Payload size boundary** — only tested at tens of bytes; the real
+   practical limit (interaction with DTN bundle lifetime/chunking and
+   Kitsune2's own message sizing) is unknown.
 
 ## Origin
 
