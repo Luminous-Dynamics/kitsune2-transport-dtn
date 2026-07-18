@@ -1,0 +1,20 @@
+[package]
+name = "kitsune2-transport-dtn"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A Kitsune2 transport backed by BPv7/DTN store-and-forward instead of WebRTC"
+repository = "https://github.com/Luminous-Dynamics/kitsune2-transport-dtn"
+
+[dependencies]
+kitsune2_api = { git = "https://github.com/holochain/kitsune2.git", rev = "62cf3446e829eaed7f3948ed29eff6dfb712413c" }
+bp7 = { version = "0.10.7", default-features = false }
+reqwest = { version = "0.12", default-features = false }
+tokio = { version = "1", features = ["full"] }
+bytes = "1.8.0"
+tracing = "0.1"
+urlencoding = "2"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+kitsune2_core = { git = "https://github.com/holochain/kitsune2.git", rev = "62cf3446e829eaed7f3948ed29eff6dfb712413c" }
