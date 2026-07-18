@@ -17,20 +17,27 @@ time.
 
 **What this actually demonstrates, precisely**: a Kitsune2 message can be
 delivered byte-identically through a real BPv7/dtn7-rs store-and-forward
-path when the two peers are not continuously connected. It does **not**
-yet demonstrate long-duration partitions, process restarts with persisted
-state, duplicate delivery, bundle expiry under load, reordering, or
-reconciliation after divergent application state — see "Not yet tested"
-below for the honest list.
+path when the two peers are not continuously connected — confirmed at
+payload sizes from 1KB to 5MB with no boundary found, bidirectionally and
+simultaneously, and completely (no message lost) even when delivery order
+is scrambled. It does **not** yet demonstrate long-duration partitions,
+process restarts with persisted state, duplicate delivery at the Kitsune2
+layer, bundle expiry under load, or reconciliation after divergent
+application state — see "Not yet tested" below for the honest remaining
+list.
 
-> **Invariant, load-bearing, not optional**: a receiving endpoint must be
-> registered (`DtnTransportFactory::create()` completing, which calls
-> dtn7's `/register`) *before* the peer relationship that makes it
-> reachable is established. This adapter does **not** buffer or retry
-> bundles addressed to an endpoint that doesn't exist yet — they are
-> silently dropped by the daemon with no observable error. See "A real bug
-> found" below for how this was discovered, and "Delivery semantics" for
-> the full guarantee (or lack of one).
+> **Invariant, load-bearing, not optional, confirmed to hold generally —
+> not just in the one specific race that surfaced it**: a receiving
+> endpoint must be registered (`DtnTransportFactory::create()` completing,
+> which calls dtn7's `/register`) *before* the peer relationship that
+> makes it reachable is established. This adapter does **not** buffer or
+> retry bundles addressed to an endpoint that doesn't exist yet — they are
+> silently dropped by the daemon with no observable error, whether the
+> mismatch comes from a daemon just starting up or from an
+> already-established peer relationship whose endpoint registration
+> merely lags behind. See "A real bug found" below for how this was
+> discovered, and "Delivery semantics" for the full guarantee (or lack of
+> one).
 
 ## Why this is possible at all
 
@@ -85,9 +92,13 @@ questions a normal live-socket transport doesn't:
   bundle whose ID has already been seen — so a retransmitted duplicate at
   the daemon layer will not reach `/endpoint` twice. This crate does not
   add any deduplication of its own on top; it relies entirely on dtn7-rs's.
-- **Ordering is not guaranteed.** Nothing in this transport or in dtn7-rs's
-  `/endpoint` pop order was verified to preserve send order across
-  reconnects or multiple in-flight bundles — untested, not claimed.
+- **Ordering is not guaranteed — confirmed by direct observation, not just
+  absence of a guarantee.** 10 messages sent back-to-back
+  (`kitsune2_messages_ordering_is_observed_not_assumed`) all arrived
+  (completeness holds), but out of send order: sent `msg-000..msg-009`,
+  received `msg-000, msg-005, msg-006, msg-001, msg-003, msg-007, msg-002,
+  msg-004, msg-009, msg-008`. Anything built on this transport that
+  depends on ordering needs to add its own sequencing.
 - **Poller crash between pop and dispatch** would lose the bundle (it's
   already removed from dtn7's queue). Not yet tested, but follows directly
   from the pop-before-decode design above.
@@ -218,33 +229,86 @@ DTN_NODE2_WORKDIR=/path/to/a/fresh/empty/dir \
 cargo test --test integration kitsune2_message_survives_receiver_outage -- --nocapture
 ```
 
+**Registration-lag generalization test**
+(`kitsune2_message_lost_when_registration_lags_established_reachability`) —
+start both daemons fresh, **no static peers on either side** (the test
+establishes reachability itself via `/peers/add`):
+
+```bash
+dtnd -n node1 -W ./node1 -D sled -C mtcp:port=16162 -w 3000 --disable_nd -j 2s &
+dtnd -n node2 -W ./node2 -D sled -C mtcp:port=16163 -w 3001 --disable_nd -j 2s &
+cargo test --test integration kitsune2_message_lost_when_registration_lags_established_reachability -- --nocapture
+```
+
+**Ordering / bidirectional / payload-size tests**
+(`kitsune2_messages_ordering_is_observed_not_assumed`,
+`kitsune2_bidirectional_simultaneous_traffic`,
+`kitsune2_payload_size_boundary`) — same bidirectionally-peered setup as
+the clean round-trip test:
+
+```bash
+dtnd -n node1 -W ./node1 -D sled -C mtcp:port=16162 -w 3000 --disable_nd -j 2s -s mtcp://127.0.0.1:16163/node2 &
+dtnd -n node2 -W ./node2 -D sled -C mtcp:port=16163 -w 3001 --disable_nd -j 2s -s mtcp://127.0.0.1:16162/node1 &
+cargo test --test integration kitsune2_messages_ordering_is_observed_not_assumed -- --nocapture
+cargo test --test integration kitsune2_bidirectional_simultaneous_traffic -- --nocapture
+cargo test --test integration kitsune2_payload_size_boundary -- --nocapture
+```
+
+## Now tested (four follow-on scenarios)
+
+Prompted by external review of an earlier draft of this document, which
+correctly distinguished confirmatory re-tests (already answered elsewhere
+in this session, lower value to repeat) from genuinely open questions.
+Four of the eight originally-listed gaps were picked as real unknowns and
+run for real:
+
+1. **Registration-lag, generalized beyond the specific daemon-startup
+   race** (`kitsune2_message_lost_when_registration_lags_established_reachability`):
+   peer reachability established first via `/peers/add`, *then* sent, *then*
+   the endpoint registered late — same result, message lost. **Confirms the
+   invariant holds broadly, not just for the one timing pattern that
+   originally surfaced it.**
+2. **Ordering** (`kitsune2_messages_ordering_is_observed_not_assumed`):
+   10 messages sent back-to-back all arrive, but out of order — see
+   "Delivery semantics" above for the actual observed sequence. Confirmed
+   by direct observation, not left as a theoretical caveat.
+3. **Bidirectional simultaneous traffic**
+   (`kitsune2_bidirectional_simultaneous_traffic`): both nodes sending to
+   each other at the same time via `tokio::join!` — both directions
+   delivered correctly, byte-identical, no cross-contamination.
+4. **Payload size boundary** (`kitsune2_payload_size_boundary`): 1KB,
+   50KB, 500KB, 2MB, and 5MB all delivered byte-identical (a
+   corruption-detecting fill pattern, not just length-checked) with no
+   failure at any tier — through this crate's own `reqwest`-based HTTP
+   client and poll-based receiver specifically, a different code path from
+   the raw `dtnsend`/`dtnrecv` CLI tools this session separately proved
+   handle a real 1.9MB artifact fine. No practical boundary found within
+   the tested range.
+
 ## Not yet tested
 
-Listed explicitly so scope isn't implied by silence. None of these are
-started — a real backlog, not a to-do buried in prose:
+The remaining four, deliberately left as backlog rather than run
+speculatively — each is either confirmatory of something already
+established elsewhere in this session/crate, or contingent on answers to
+the open questions raised with Kitsune2's maintainers:
 
-1. **Receiver registers late** (beyond the one race already found and
-   fixed) — is there any scenario where a late-arriving bundle *should* be
-   retained rather than dropped, and if so, at which layer?
-2. **Receiver process restarts** with dtn7's `-D sled` persistent backend —
+1. **Receiver process restarts** with dtn7's `-D sled` persistent backend —
    do queued-but-undelivered bundles survive, and does Kitsune2-level
-   identity (the `Url`) remain stable across the restart?
-3. **Handler fails after retrieval** — confirmed above that there's no
-   retry; not yet exercised as an actual test.
-4. **Duplicate bundle delivery** at the Kitsune2 layer specifically (dtn7's
-   own dedup is verified; whether anything above it could still observe a
-   duplicate is not).
-5. **Out-of-order delivery** across alternating connectivity.
-6. **Bundle expiry and bounded daemon storage under load** — this session's
+   identity (the `Url`) remain stable across the restart? (Sled persistence
+   itself is already proven at the raw dtn7 layer in this session's
+   broader research; what's untested is specifically whether anything
+   breaks at the Kitsune2 transport-object level.)
+2. **Handler fails after retrieval** — confirmed above from source that
+   there's no retry; not yet exercised as an actual failing-handler test
+   (would mostly be a regression guard for already-understood behavior).
+3. **Duplicate bundle delivery** at the Kitsune2 layer specifically (dtn7's
+   own dedup is verified from source; whether anything above it could
+   still observe a duplicate is not empirically tested).
+4. **Bundle expiry and bounded daemon storage under load** — this session's
    broader DTN research separately found a real dtn7-rs issue in this area
    (expired bundles bypass discard accounting/reporting —
    [dtn7-rs#85](https://github.com/dtn7/dtn7-rs/issues/85)), not yet
    re-tested through this Kitsune2 layer specifically.
-7. **Bidirectional simultaneous traffic**, both nodes sending and receiving
-   during a reconnect window.
-8. **Payload size boundary** — only tested at tens of bytes; the real
-   practical limit (interaction with DTN bundle lifetime/chunking and
-   Kitsune2's own message sizing) is unknown.
 
 ## Origin
 

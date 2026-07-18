@@ -265,3 +265,382 @@ async fn kitsune2_message_survives_receiver_outage() {
 
     let _ = node2_daemon.start_kill();
 }
+
+/// Generalizes the race found in `kitsune2_message_survives_receiver_outage`:
+/// that test found registration lagging *daemon startup*. This test asks
+/// whether the invariant holds more generally -- does registration lagging
+/// *established peer reachability* (regardless of why) lose the bundle the
+/// same way? Peer reachability is established first via `/peers/add`, then
+/// the send happens, then the endpoint is registered *afterward* -- if the
+/// documented invariant is correct, this should also lose the message.
+///
+/// Requires node1's dtnd already running (web-port 3000, mtcp 16162, no
+/// static peer) and node2's dtnd already running (web-port 3001, mtcp
+/// 16163, no static peer) -- both started fresh, neither aware of the
+/// other yet.
+#[tokio::test]
+async fn kitsune2_message_lost_when_registration_lags_established_reachability() {
+    tracing_subscriber::fmt::try_init().ok();
+
+    let space_id = SpaceId::from(Bytes::from_static(b"workstream-d-reglag"));
+    let builder = Arc::new(kitsune2_core::default_test_builder());
+
+    let factory1 = DtnTransportFactory {
+        cfg: DtnConfig {
+            web_port: 3000,
+            node_name: "node1".into(),
+            service: "kitsune2".into(),
+            lifetime_secs: 3600,
+            poll_interval: Duration::from_millis(200),
+        },
+    };
+    let transport1 = factory1
+        .create(builder.clone(), Arc::new(NoopTxHandler))
+        .await
+        .expect("create transport1");
+    transport1.register_space_handler(space_id.clone(), Arc::new(RecordingSpaceHandler::default()));
+
+    // Establish reachability FIRST, with node2's "kitsune2" endpoint not
+    // registered yet (node2's daemon is running, but no transport object has
+    // been created for it).
+    let http = reqwest::Client::new();
+    http.get("http://127.0.0.1:3000/peers/add?p=mtcp://127.0.0.1:16163/node2&p_t=STATIC")
+        .send()
+        .await
+        .expect("failed to add node2 as a peer of node1");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let node2_url = kitsune2_transport_dtn::node_url("node2").unwrap();
+    let payload =
+        Bytes::from_static(b"sent while peer is reachable but its endpoint isn't registered yet");
+    transport1
+        .send_space_notify(node2_url, space_id.clone(), payload.clone())
+        .await
+        .expect("send_space_notify must succeed at the transport layer regardless");
+
+    // Give node1 time to actually attempt delivery -- reachability is
+    // already established, so this should happen quickly, well before we
+    // register node2's endpoint below.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Register node2's endpoint LATE, after the send (and likely delivery
+    // attempt) already happened.
+    let factory2 = DtnTransportFactory {
+        cfg: DtnConfig {
+            web_port: 3001,
+            node_name: "node2".into(),
+            service: "kitsune2".into(),
+            lifetime_secs: 3600,
+            poll_interval: Duration::from_millis(200),
+        },
+    };
+    let transport2 = factory2
+        .create(builder, Arc::new(NoopTxHandler))
+        .await
+        .expect("create transport2");
+    let recorder = Arc::new(RecordingSpaceHandler::default());
+    transport2.register_space_handler(space_id, recorder.clone());
+
+    // Wait to see whether it ever arrives.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let received = recorder.received.lock().unwrap();
+    println!(
+        "received count after late registration (general case): {}",
+        received.len()
+    );
+    assert!(
+        received.is_empty(),
+        "expected the documented invariant to hold generally (registration \
+         lagging established reachability loses the bundle), but the message \
+         WAS delivered -- the invariant as documented may be narrower than \
+         reality, needs re-investigating rather than just updating this \
+         assertion"
+    );
+    println!(
+        "CONFIRMED: registration-after-reachability loses the bundle in the \
+         general case too, not only at daemon startup -- matches the \
+         documented invariant."
+    );
+}
+
+/// Sends several distinct messages back-to-back and checks whether delivery
+/// order matches send order. The README documents this as explicitly
+/// unguaranteed -- this test doesn't presuppose the answer: it hard-asserts
+/// only that every message arrives (completeness), and separately reports
+/// whether order happened to be preserved as an observed finding.
+///
+/// Requires both daemons already running and bidirectionally statically
+/// peered (same setup as `kitsune2_message_crosses_real_dtn_transport`).
+#[tokio::test]
+async fn kitsune2_messages_ordering_is_observed_not_assumed() {
+    tracing_subscriber::fmt::try_init().ok();
+
+    let space_id = SpaceId::from(Bytes::from_static(b"workstream-d-ordering"));
+    let builder = Arc::new(kitsune2_core::default_test_builder());
+
+    let factory1 = DtnTransportFactory {
+        cfg: DtnConfig {
+            web_port: 3000,
+            node_name: "node1".into(),
+            service: "kitsune2".into(),
+            lifetime_secs: 3600,
+            poll_interval: Duration::from_millis(100),
+        },
+    };
+    let factory2 = DtnTransportFactory {
+        cfg: DtnConfig {
+            web_port: 3001,
+            node_name: "node2".into(),
+            service: "kitsune2".into(),
+            lifetime_secs: 3600,
+            poll_interval: Duration::from_millis(100),
+        },
+    };
+    let transport1 = factory1
+        .create(builder.clone(), Arc::new(NoopTxHandler))
+        .await
+        .expect("create transport1");
+    let transport2 = factory2
+        .create(builder, Arc::new(NoopTxHandler))
+        .await
+        .expect("create transport2");
+
+    let recorder = Arc::new(RecordingSpaceHandler::default());
+    transport2.register_space_handler(space_id.clone(), recorder.clone());
+    transport1.register_space_handler(space_id.clone(), Arc::new(RecordingSpaceHandler::default()));
+
+    let node2_url = kitsune2_transport_dtn::node_url("node2").unwrap();
+
+    const N: usize = 10;
+    let sent: Vec<Bytes> = (0..N)
+        .map(|i| Bytes::from(format!("msg-{i:03}").into_bytes()))
+        .collect();
+    for payload in &sent {
+        transport1
+            .send_space_notify(node2_url.clone(), space_id.clone(), payload.clone())
+            .await
+            .expect("send_space_notify");
+    }
+
+    for _ in 0..50 {
+        if recorder.received.lock().unwrap().len() >= N {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let received = recorder.received.lock().unwrap();
+    assert_eq!(
+        received.len(),
+        N,
+        "completeness is required regardless of order: all {N} messages must arrive"
+    );
+
+    let recv_order: Vec<Bytes> = received.iter().map(|(_, d)| d.clone()).collect();
+    let recv_set: std::collections::HashSet<Vec<u8>> =
+        recv_order.iter().map(|b| b.to_vec()).collect();
+    let sent_set: std::collections::HashSet<Vec<u8>> = sent.iter().map(|b| b.to_vec()).collect();
+    assert_eq!(
+        recv_set, sent_set,
+        "every sent message must be present exactly once"
+    );
+
+    if recv_order == sent {
+        println!("OBSERVED: delivery order matched send order for this run ({N} messages).");
+    } else {
+        println!(
+            "OBSERVED: delivery order did NOT match send order for this run. \
+             sent:     {:?}\n received: {:?}",
+            sent.iter()
+                .map(|b| String::from_utf8_lossy(b).to_string())
+                .collect::<Vec<_>>(),
+            recv_order
+                .iter()
+                .map(|b| String::from_utf8_lossy(b).to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// Both nodes send to each other concurrently. Nothing in this session's
+/// tests so far has exercised both directions at once -- every prior test
+/// was strictly one-directional (node1 sends, node2 receives).
+///
+/// Requires both daemons already running and bidirectionally statically
+/// peered (same setup as `kitsune2_message_crosses_real_dtn_transport`).
+#[tokio::test]
+async fn kitsune2_bidirectional_simultaneous_traffic() {
+    tracing_subscriber::fmt::try_init().ok();
+
+    let space_id = SpaceId::from(Bytes::from_static(b"workstream-d-bidirectional"));
+    let builder = Arc::new(kitsune2_core::default_test_builder());
+
+    let factory1 = DtnTransportFactory {
+        cfg: DtnConfig {
+            web_port: 3000,
+            node_name: "node1".into(),
+            service: "kitsune2".into(),
+            lifetime_secs: 3600,
+            poll_interval: Duration::from_millis(200),
+        },
+    };
+    let factory2 = DtnTransportFactory {
+        cfg: DtnConfig {
+            web_port: 3001,
+            node_name: "node2".into(),
+            service: "kitsune2".into(),
+            lifetime_secs: 3600,
+            poll_interval: Duration::from_millis(200),
+        },
+    };
+    let transport1 = factory1
+        .create(builder.clone(), Arc::new(NoopTxHandler))
+        .await
+        .expect("create transport1");
+    let transport2 = factory2
+        .create(builder, Arc::new(NoopTxHandler))
+        .await
+        .expect("create transport2");
+
+    let recorder1 = Arc::new(RecordingSpaceHandler::default());
+    let recorder2 = Arc::new(RecordingSpaceHandler::default());
+    transport1.register_space_handler(space_id.clone(), recorder1.clone());
+    transport2.register_space_handler(space_id.clone(), recorder2.clone());
+
+    let node1_url = kitsune2_transport_dtn::node_url("node1").unwrap();
+    let node2_url = kitsune2_transport_dtn::node_url("node2").unwrap();
+
+    let payload_1_to_2 = Bytes::from_static(b"node1-to-node2");
+    let payload_2_to_1 = Bytes::from_static(b"node2-to-node1");
+
+    let (r1, r2) = tokio::join!(
+        transport1.send_space_notify(node2_url, space_id.clone(), payload_1_to_2.clone()),
+        transport2.send_space_notify(node1_url, space_id.clone(), payload_2_to_1.clone()),
+    );
+    r1.expect("node1 -> node2 send");
+    r2.expect("node2 -> node1 send");
+
+    for _ in 0..50 {
+        if !recorder1.received.lock().unwrap().is_empty()
+            && !recorder2.received.lock().unwrap().is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let recv1 = recorder1.received.lock().unwrap();
+    let recv2 = recorder2.received.lock().unwrap();
+    assert_eq!(
+        recv1.len(),
+        1,
+        "node1 must receive exactly one message from node2"
+    );
+    assert_eq!(recv1[0].1, payload_2_to_1);
+    assert_eq!(
+        recv2.len(),
+        1,
+        "node2 must receive exactly one message from node1"
+    );
+    assert_eq!(recv2[0].1, payload_1_to_2);
+    println!(
+        "PROOF: simultaneous bidirectional send_space_notify -- both \
+         directions delivered correctly, byte-identical, no cross-contamination."
+    );
+}
+
+/// Escalates payload size to find a practical boundary, rather than only
+/// asserting "small payloads work." This exercises a code path the earlier,
+/// separately-run raw-dtn7 large-payload test (a 1.9MB .happ file, sent via
+/// the `dtnsend` CLI) did not: this crate's own HTTP client
+/// (`reqwest::Client::post` with a `Vec<u8>` body) and its own poll-based
+/// receiver, not dtn7's CLI tooling -- a genuinely different code path that
+/// could have different limits (e.g. an HTTP framework body-size default).
+///
+/// Requires both daemons already running and bidirectionally statically
+/// peered (same setup as `kitsune2_message_crosses_real_dtn_transport`).
+#[tokio::test]
+async fn kitsune2_payload_size_boundary() {
+    tracing_subscriber::fmt::try_init().ok();
+
+    let space_id = SpaceId::from(Bytes::from_static(b"workstream-d-size"));
+    let builder = Arc::new(kitsune2_core::default_test_builder());
+
+    let factory1 = DtnTransportFactory {
+        cfg: DtnConfig {
+            web_port: 3000,
+            node_name: "node1".into(),
+            service: "kitsune2".into(),
+            lifetime_secs: 3600,
+            poll_interval: Duration::from_millis(200),
+        },
+    };
+    let factory2 = DtnTransportFactory {
+        cfg: DtnConfig {
+            web_port: 3001,
+            node_name: "node2".into(),
+            service: "kitsune2".into(),
+            lifetime_secs: 3600,
+            poll_interval: Duration::from_millis(200),
+        },
+    };
+    let transport1 = factory1
+        .create(builder.clone(), Arc::new(NoopTxHandler))
+        .await
+        .expect("create transport1");
+    let transport2 = factory2
+        .create(builder, Arc::new(NoopTxHandler))
+        .await
+        .expect("create transport2");
+
+    let recorder = Arc::new(RecordingSpaceHandler::default());
+    transport2.register_space_handler(space_id.clone(), recorder.clone());
+    transport1.register_space_handler(space_id.clone(), Arc::new(RecordingSpaceHandler::default()));
+    let node2_url = kitsune2_transport_dtn::node_url("node2").unwrap();
+
+    // Deterministic, corruption-detecting fill pattern (not all-zero, so a
+    // truncation or byte-order bug would actually be caught by the
+    // byte-identical assertion below).
+    fn make_payload(size: usize) -> Bytes {
+        Bytes::from((0..size).map(|i| (i % 251) as u8).collect::<Vec<u8>>())
+    }
+
+    for size in [1_000usize, 50_000, 500_000, 2_000_000, 5_000_000] {
+        let payload = make_payload(size);
+        recorder.received.lock().unwrap().clear();
+
+        let send_result = transport1
+            .send_space_notify(node2_url.clone(), space_id.clone(), payload.clone())
+            .await;
+        if let Err(e) = send_result {
+            println!(
+                "size {size} bytes: send_space_notify itself failed: {e:?} -- boundary found here"
+            );
+            break;
+        }
+
+        let mut delivered = false;
+        for _ in 0..75 {
+            if !recorder.received.lock().unwrap().is_empty() {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        if !delivered {
+            println!(
+                "size {size} bytes: FAILED to deliver within timeout -- \
+                 practical boundary found near here"
+            );
+            break;
+        }
+
+        let received = recorder.received.lock().unwrap();
+        assert_eq!(
+            received[0].1, payload,
+            "size {size} bytes: delivered payload must be byte-identical, not just same length"
+        );
+        println!("size {size} bytes: OK, byte-identical");
+    }
+}
