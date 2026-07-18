@@ -92,12 +92,18 @@ questions a normal live-socket transport doesn't:
   bundle whose ID has already been seen — so a retransmitted duplicate at
   the daemon layer will not reach `/endpoint` twice. This crate does not
   add any deduplication of its own on top; it relies entirely on dtn7-rs's.
-- **Ordering is not guaranteed — confirmed by direct observation, not just
-  absence of a guarantee.** 10 messages sent back-to-back
-  (`kitsune2_messages_ordering_is_observed_not_assumed`) all arrived
-  (completeness holds), but out of send order: sent `msg-000..msg-009`,
+- **Ordering is not guaranteed — confirmed by direct observation across two
+  independent runs, not just absence of a guarantee, and not a one-off.**
+  10 messages sent back-to-back (`kitsune2_messages_ordering_is_observed_not_assumed`)
+  all arrived (completeness holds) both times, but out of send order each
+  time, with a *different* scramble each run: sent `msg-000..msg-009`,
   received `msg-000, msg-005, msg-006, msg-001, msg-003, msg-007, msg-002,
-  msg-004, msg-009, msg-008`. Anything built on this transport that
+  msg-004, msg-009, msg-008` on the first run, `msg-000, msg-002, msg-001,
+  msg-003, msg-005, msg-004, msg-006, msg-009, msg-008, msg-007` on a
+  re-run — the differing pattern between runs is itself informative: this
+  is genuine non-determinism in the delivery path, not a fixed bug in this
+  crate's own ordering logic (which would reproduce identically). Anything
+  built on this transport that
   depends on ordering needs to add its own sequencing.
 - **Poller crash between pop and dispatch** would lose the bundle (it's
   already removed from dtn7's queue). Not yet tested, but follows directly
@@ -267,11 +273,21 @@ run for real:
    peer reachability established first via `/peers/add`, *then* sent, *then*
    the endpoint registered late — same result, message lost. **Confirms the
    invariant holds broadly, not just for the one timing pattern that
-   originally surfaced it.**
+   originally surfaced it.** Verified via node2's own debug log on a
+   second run, not just the test's app-level assertion: `Received bundle`
+   / `Dispatching bundle` at one timestamp, `Registered new application
+   agent for EID: dtn://node2/kitsune2` almost two seconds later, and
+   critically — no `Delivering`/`Removing bundle` line ever follows,
+   exactly matching the log signature of the original, already-fixed
+   race. Same mechanism, confirmed at the daemon level, not a different
+   failure mode that happens to look similar from the application side.
 2. **Ordering** (`kitsune2_messages_ordering_is_observed_not_assumed`):
    10 messages sent back-to-back all arrive, but out of order — see
-   "Delivery semantics" above for the actual observed sequence. Confirmed
-   by direct observation, not left as a theoretical caveat.
+   "Delivery semantics" above for the actual observed sequences (two
+   independent runs, two different scrambles, confirming genuine
+   non-determinism rather than a one-off or a fixed bug in this crate's
+   own logic). Confirmed by direct, repeated observation, not left as a
+   theoretical caveat.
 3. **Bidirectional simultaneous traffic**
    (`kitsune2_bidirectional_simultaneous_traffic`): both nodes sending to
    each other at the same time via `tokio::join!` — both directions
