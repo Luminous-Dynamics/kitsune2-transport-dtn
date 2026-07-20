@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Check default targets
+        run: cargo check --all-targets --locked
+      - name: Check real-daemon test code
+        run: cargo check --tests --features real-dtn-tests --locked
+      - name: Clippy library
+        run: cargo clippy --lib --locked -- -D warnings
+      - name: Unit and hermetic contract tests
+        run: cargo test --locked
+
+  real-daemon-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: dtn7/dtn7-rs
+          ref: c30181b4b111e2adc5538931c797c0f7190acc4c
+          path: dtn7-rs
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build pinned dtnd
+        run: cargo build --release -p dtn7 --manifest-path dtn7-rs/Cargo.toml
+      - name: Run self-contained real-daemon smoke test
+        env:
+          DTN_BIN: ${{ github.workspace }}/dtn7-rs/target/release/dtnd
+        run: >-
+          cargo test --test harnessed_smoke --features real-dtn-tests
+          -- --ignored --nocapture
