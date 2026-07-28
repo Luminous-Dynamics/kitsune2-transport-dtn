@@ -173,9 +173,11 @@ node1                    dtn7 node1              dtn7 node2         node2 (this 
 - **Peer/endpoint registration ordering matters and is not free** (see
   below) — this is a real operational property of the underlying daemon,
   not something this crate smooths over.
-- Only tested at small (tens-of-bytes) payload sizes. The interplay between
-  DTN bundle lifetimes/chunking and Kitsune2's own message sizing at real
-  Holochain scale is unexplored.
+- Payloads from 1KB through 5MB have been tested successfully with
+  corruption-detecting fill patterns and byte-identical delivery. No failure
+  boundary was found within that range. Behavior above 5MB, under concurrent
+  large-message load, bundle expiry, and sustained storage pressure remains
+  untested.
 - This is the transport primitive only, not a Holochain conductor
   integration — wiring the actual `holochain` conductor to select this
   transport instead of its built-in WebRTC path is a separate, unstarted
