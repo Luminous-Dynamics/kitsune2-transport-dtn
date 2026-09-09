@@ -13,14 +13,19 @@
 //!   not connection-oriented, so there is no live "connected" set to report.
 //! - Receiving is poll-based (dtn7's `/endpoint` is a destructive
 //!   pop-next-bundle HTTP call), so latency is bounded by the poll interval.
-//! - Successfully read raw bundles are journaled before BPv7 decoding and
-//!   Kitsune2 dispatch, so committed records can be replayed after restart.
+//! - Successfully read raw bundles are durably journaled before BPv7 decoding
+//!   and Kitsune2 dispatch; pending records are replayed after restart.
+//! - The receiver applies strict backpressure: it does not destructively pop a
+//!   new bundle while an older journal record remains undispatched or cannot be
+//!   durably removed after handler success.
 //! - There is still an unavoidable loss window after dtn7's destructive pop
 //!   and before the HTTP body is completely read and durably journaled.
 //! - Replay is intentionally at-least-once. A crash after handler success but
 //!   before journal deletion can deliver the same logical message again; this
 //!   crate does not yet define idempotent message identity or exactly-once
 //!   semantics.
+//! - Journal checksums detect accidental local corruption only; they are not
+//!   authentication or adversarial tamper protection.
 //! - No retry/backoff tuning beyond dtn7's own; this crate is a thin bridge,
 //!   not a reimplementation of DTN semantics.
 
@@ -56,7 +61,8 @@ pub struct DtnConfig {
     /// Bundle lifetime, in seconds.
     pub lifetime_secs: u64,
     /// How often to poll `/endpoint` after the application-agent queue is
-    /// observed empty or after a poll error.
+    /// observed empty, blocked on a retained journal record, or after a poll
+    /// error.
     pub poll_interval: Duration,
 }
 
@@ -117,7 +123,6 @@ fn inbound_journal_settings(cfg: &DtnConfig) -> K2Result<(PathBuf, u64)> {
             "dtn inbound journal capacity must be at least {MAX_BUNDLE_BYTES} bytes"
         )));
     }
-
     Ok((root, max_pending_bytes))
 }
 
@@ -177,9 +182,9 @@ impl TxImp for DtnTxImp {
                 .body(data)
                 .send()
                 .await
-                .map_err(|e| K2Error::other_src("dtn /send failed", e))?
+                .map_err(|error| K2Error::other_src("dtn /send failed", error))?
                 .error_for_status()
-                .map_err(|e| K2Error::other_src("dtn /send returned an error status", e))?;
+                .map_err(|error| K2Error::other_src("dtn /send returned an error status", error))?;
             Ok(())
         })
     }
@@ -191,7 +196,6 @@ impl TxImp for DtnTxImp {
     }
 
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>> {
-        // Honest limitation: no live "connected" concept over DTN.
         Box::pin(async { Ok(vec![]) })
     }
 
@@ -207,8 +211,8 @@ impl TxImp for DtnTxImp {
     }
 }
 
-fn extract_payload(bndl: &bp7::Bundle) -> Option<Vec<u8>> {
-    let block = bndl.extension_block_by_type(bp7::canonical::PAYLOAD_BLOCK)?;
+fn extract_payload(bundle: &bp7::Bundle) -> Option<Vec<u8>> {
+    let block = bundle.extension_block_by_type(bp7::canonical::PAYLOAD_BLOCK)?;
     match block.data() {
         bp7::canonical::CanonicalData::Data(data) => Some(data.clone()),
         _ => None,
@@ -236,7 +240,7 @@ async fn read_bounded_body(mut response: reqwest::Response) -> K2Result<Bytes> {
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| K2Error::other_src("failed to read dtn /endpoint response body", e))?
+        .map_err(|error| K2Error::other_src("failed to read dtn /endpoint response body", error))?
     {
         if body.len().saturating_add(chunk.len()) > MAX_BUNDLE_BYTES {
             return Err(K2Error::other(format!(
@@ -249,12 +253,12 @@ async fn read_bounded_body(mut response: reqwest::Response) -> K2Result<Bytes> {
 }
 
 async fn dispatch_bundle(raw: Bytes, hnd: &Arc<TxImpHnd>) -> K2Result<()> {
-    let bndl = bp7::Bundle::try_from(raw.to_vec()).map_err(|error| {
+    let bundle = bp7::Bundle::try_from(raw.to_vec()).map_err(|error| {
         K2Error::other(format!("failed to decode received bundle as bp7 Bundle: {error:?}"))
     })?;
-    let payload = extract_payload(&bndl)
+    let payload = extract_payload(&bundle)
         .ok_or_else(|| K2Error::other("received BPv7 bundle without a payload block"))?;
-    let source_eid = bndl.primary.source.to_string();
+    let source_eid = bundle.primary.source.to_string();
     let node_name = source_node_name(&source_eid).ok_or_else(|| {
         K2Error::other(format!(
             "unsupported dtn source EID {source_eid:?}; expected dtn://<URI-unreserved-node>/"
@@ -265,40 +269,32 @@ async fn dispatch_bundle(raw: Bytes, hnd: &Arc<TxImpHnd>) -> K2Result<()> {
     Ok(())
 }
 
-async fn replay_pending(journal: &InboundJournal, hnd: &Arc<TxImpHnd>) -> K2Result<()> {
+/// Replay pending records in deterministic journal order.
+///
+/// `Ok(true)` means the journal is drained and destructive polling may resume.
+/// `Ok(false)` means one record remains because dispatch failed; callers must
+/// apply backpressure and retry later. Journal read/cleanup failures are harder
+/// errors and stop the receiver rather than risking loss or a duplicate storm.
+async fn replay_pending(journal: &InboundJournal, hnd: &Arc<TxImpHnd>) -> K2Result<bool> {
     for record in journal.pending().await? {
-        let raw = match journal.read(&record).await {
-            Ok(raw) => raw,
-            Err(error) => {
-                tracing::warn!(
-                    ?error,
-                    path = ?record.path(),
-                    "could not read pending dtn journal record; retaining it"
-                );
-                continue;
-            }
-        };
-
-        match dispatch_bundle(raw, hnd).await {
-            Ok(()) => {
-                if let Err(error) = journal.mark_delivered(&record).await {
-                    tracing::warn!(
-                        ?error,
-                        path = ?record.path(),
-                        "dtn handler succeeded but journal cleanup failed; replay may duplicate delivery"
-                    );
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    ?error,
-                    path = ?record.path(),
-                    "pending dtn journal dispatch failed; retaining record for later replay"
-                );
-            }
+        let raw = journal.read(&record).await?;
+        if let Err(error) = dispatch_bundle(raw, hnd).await {
+            tracing::warn!(
+                ?error,
+                path = ?record.path(),
+                "pending dtn journal dispatch failed; retaining record and backpressuring receive"
+            );
+            return Ok(false);
         }
+
+        journal.mark_delivered(&record).await.map_err(|error| {
+            K2Error::other(format!(
+                "dtn handler succeeded but journal cleanup failed for {:?}; receiver stopped to avoid repeated duplicate delivery: {error}",
+                record.path()
+            ))
+        })?;
     }
-    Ok(())
+    Ok(true)
 }
 
 fn spawn_receiver(
@@ -313,21 +309,25 @@ fn spawn_receiver(
             cfg.web_port,
             urlencoding::encode(&cfg.service)
         );
+
         loop {
-            // Replay retained records before destructively popping more data.
-            // Repeating this once per poll cycle also permits application
-            // handlers registered shortly after transport creation to consume
-            // records that were not dispatchable during the first pass.
-            if let Err(error) = replay_pending(&journal, &hnd).await {
-                tracing::error!(
-                    ?error,
-                    "dtn inbound journal replay failed; stopping receiver before further destructive pops"
-                );
-                return;
+            match replay_pending(&journal, &hnd).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tokio::time::sleep(cfg.poll_interval).await;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        ?error,
+                        "dtn inbound journal replay failed; stopping receiver before further destructive pops"
+                    );
+                    return;
+                }
             }
 
-            // Drain the application-agent queue without sleeping between
-            // bundles. Sleep only once the queue is empty or polling fails.
+            // Drain dtn7 only while every previously popped record has either
+            // dispatched and been durably removed or the queue is empty.
             loop {
                 let response = match client.get(&poll_url).send().await {
                     Ok(response) => response,
@@ -336,7 +336,6 @@ fn spawn_receiver(
                         break;
                     }
                 };
-
                 let response = match response.error_for_status() {
                     Ok(response) => response,
                     Err(error) => {
@@ -344,7 +343,6 @@ fn spawn_receiver(
                         break;
                     }
                 };
-
                 let raw = match read_bounded_body(response).await {
                     Ok(raw) => raw,
                     Err(error) => {
@@ -365,7 +363,7 @@ fn spawn_receiver(
                     Err(error) => {
                         tracing::error!(
                             ?error,
-                            "could not durably journal destructively popped dtn bundle; stopping receiver to avoid popping additional bundles"
+                            "could not durably journal destructively popped dtn bundle; stopping receiver to avoid additional pops"
                         );
                         return;
                     }
@@ -374,19 +372,21 @@ fn spawn_receiver(
                 match dispatch_bundle(raw, &hnd).await {
                     Ok(()) => {
                         if let Err(error) = journal.mark_delivered(&record).await {
-                            tracing::warn!(
+                            tracing::error!(
                                 ?error,
                                 path = ?record.path(),
-                                "dtn handler succeeded but journal cleanup failed; replay may duplicate delivery"
+                                "dtn handler succeeded but journal cleanup failed; stopping receiver to avoid repeated duplicate delivery"
                             );
+                            return;
                         }
                     }
                     Err(error) => {
                         tracing::warn!(
                             ?error,
                             path = ?record.path(),
-                            "dtn dispatch failed after durable journal commit; retaining record for replay"
+                            "dtn dispatch failed after durable journal commit; retaining record and backpressuring receive"
                         );
+                        break;
                     }
                 }
             }
@@ -424,6 +424,7 @@ impl TransportFactory for DtnTransportFactory {
         Box::pin(async move {
             validate_dtn_config(&cfg)?;
             let (journal_root, journal_max_bytes) = inbound_journal_settings(&cfg)?;
+
             // Journal readiness is load-bearing. Refuse to register the
             // destructive receive endpoint if durable handoff cannot be opened.
             let journal =
@@ -435,7 +436,7 @@ impl TransportFactory for DtnTransportFactory {
                 .connect_timeout(HTTP_CONNECT_TIMEOUT)
                 .timeout(HTTP_REQUEST_TIMEOUT)
                 .build()
-                .map_err(|e| K2Error::other_src("failed to build dtn HTTP client", e))?;
+                .map_err(|error| K2Error::other_src("failed to build dtn HTTP client", error))?;
 
             // Registration is load-bearing: do not return a transport unless
             // the daemon confirms the application endpoint was registered.
@@ -448,13 +449,14 @@ impl TransportFactory for DtnTransportFactory {
                 .get(&register_url)
                 .send()
                 .await
-                .map_err(|e| K2Error::other_src("dtn /register failed", e))?
+                .map_err(|error| K2Error::other_src("dtn /register failed", error))?
                 .error_for_status()
-                .map_err(|e| K2Error::other_src("dtn /register returned an error status", e))?;
+                .map_err(|error| {
+                    K2Error::other_src("dtn /register returned an error status", error)
+                })?;
 
             let receiver_abort =
                 spawn_receiver(cfg.clone(), client.clone(), hnd.clone(), journal);
-
             let imp: DynTxImp = Arc::new(DtnTxImp {
                 cfg,
                 client,
@@ -520,7 +522,6 @@ mod tests {
     fn config_validation_rejects_unsafe_or_inert_values() {
         let mut cfg = valid_config();
         assert!(validate_dtn_config(&cfg).is_ok());
-
         cfg.web_port = 0;
         assert!(validate_dtn_config(&cfg).is_err());
         cfg = valid_config();
