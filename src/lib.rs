@@ -13,16 +13,26 @@
 //!   not connection-oriented, so there is no live "connected" set to report.
 //! - Receiving is poll-based (dtn7's `/endpoint` is a destructive
 //!   pop-next-bundle HTTP call), so latency is bounded by the poll interval.
-//! - A bundle is gone from dtn7 before decoding and Kitsune2 dispatch. Decode
-//!   or handler failure therefore loses that bundle; this bridge cannot retry.
+//! - Successfully read raw bundles are journaled before BPv7 decoding and
+//!   Kitsune2 dispatch, so committed records can be replayed after restart.
+//! - There is still an unavoidable loss window after dtn7's destructive pop
+//!   and before the HTTP body is completely read and durably journaled.
+//! - Replay is intentionally at-least-once. A crash after handler success but
+//!   before journal deletion can deliver the same logical message again; this
+//!   crate does not yet define idempotent message identity or exactly-once
+//!   semantics.
 //! - No retry/backoff tuning beyond dtn7's own; this crate is a thin bridge,
 //!   not a reimplementation of DTN semantics.
 
+mod journal;
+
 use bytes::{Bytes, BytesMut};
+use journal::InboundJournal;
 use kitsune2_api::{
     BoxFut, Builder, Config, DefaultTransport, DynTransport, DynTxHandler, DynTxImp, K2Error,
     K2Result, TransportConnectionStats, TransportFactory, TransportStats, TxImp, TxImpHnd, Url,
 };
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +40,9 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DTN_SEGMENT_BYTES: usize = 255;
+const DEFAULT_JOURNAL_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const JOURNAL_ROOT_ENV: &str = "KITSUNE2_DTN_JOURNAL_ROOT";
+const JOURNAL_MAX_BYTES_ENV: &str = "KITSUNE2_DTN_JOURNAL_MAX_BYTES";
 
 /// Configuration for the DTN-backed transport.
 #[derive(Clone, Debug)]
@@ -75,6 +88,37 @@ fn validate_dtn_config(cfg: &DtnConfig) -> K2Result<()> {
         return Err(K2Error::other("dtn poll interval must be non-zero"));
     }
     Ok(())
+}
+
+fn inbound_journal_settings(cfg: &DtnConfig) -> K2Result<(PathBuf, u64)> {
+    let base = std::env::var_os(JOURNAL_ROOT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".kitsune2-dtn-journal"));
+    let root = base
+        .join(format!("{}-{}", cfg.node_name, cfg.web_port))
+        .join(&cfg.service);
+
+    let max_pending_bytes = match std::env::var(JOURNAL_MAX_BYTES_ENV) {
+        Ok(value) => value.parse::<u64>().map_err(|_| {
+            K2Error::other(format!(
+                "{JOURNAL_MAX_BYTES_ENV} must be an unsigned byte count"
+            ))
+        })?,
+        Err(std::env::VarError::NotPresent) => DEFAULT_JOURNAL_MAX_BYTES,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(K2Error::other(format!(
+                "{JOURNAL_MAX_BYTES_ENV} must be valid Unicode digits"
+            )));
+        }
+    };
+
+    if max_pending_bytes < MAX_BUNDLE_BYTES as u64 {
+        return Err(K2Error::other(format!(
+            "dtn inbound journal capacity must be at least {MAX_BUNDLE_BYTES} bytes"
+        )));
+    }
+
+    Ok((root, max_pending_bytes))
 }
 
 /// Build the nominal Kitsune2 [`Url`] for a given DTN node name.
@@ -204,53 +248,64 @@ async fn read_bounded_body(mut response: reqwest::Response) -> K2Result<Bytes> {
     Ok(body.freeze())
 }
 
-async fn dispatch_bundle(raw: Bytes, hnd: &Arc<TxImpHnd>) {
-    match bp7::Bundle::try_from(raw.to_vec()) {
-        Ok(bndl) => {
-            let Some(payload) = extract_payload(&bndl) else {
-                tracing::warn!("received BPv7 bundle without a payload block");
-                return;
-            };
-            let source_eid = bndl.primary.source.to_string();
-            let Some(node_name) = source_node_name(&source_eid) else {
-                tracing::warn!(
-                    %source_eid,
-                    "unsupported dtn source EID; expected dtn://<URI-unreserved-node>/"
-                );
-                return;
-            };
+async fn dispatch_bundle(raw: Bytes, hnd: &Arc<TxImpHnd>) -> K2Result<()> {
+    let bndl = bp7::Bundle::try_from(raw.to_vec()).map_err(|error| {
+        K2Error::other(format!("failed to decode received bundle as bp7 Bundle: {error:?}"))
+    })?;
+    let payload = extract_payload(&bndl)
+        .ok_or_else(|| K2Error::other("received BPv7 bundle without a payload block"))?;
+    let source_eid = bndl.primary.source.to_string();
+    let node_name = source_node_name(&source_eid).ok_or_else(|| {
+        K2Error::other(format!(
+            "unsupported dtn source EID {source_eid:?}; expected dtn://<URI-unreserved-node>/"
+        ))
+    })?;
+    let peer_url = node_url(node_name)?;
+    hnd.recv_data(peer_url, Bytes::from(payload)).await?;
+    Ok(())
+}
 
-            match node_url(node_name) {
-                Ok(peer_url) => {
-                    if let Err(error) = hnd.recv_data(peer_url, Bytes::from(payload)).await {
-                        tracing::warn!(
-                            ?error,
-                            "recv_data failed; bundle was already popped and cannot be retried"
-                        );
-                    }
-                }
-                Err(error) => {
+async fn replay_pending(journal: &InboundJournal, hnd: &Arc<TxImpHnd>) -> K2Result<()> {
+    for record in journal.pending().await? {
+        let raw = match journal.read(&record).await {
+            Ok(raw) => raw,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    path = ?record.path(),
+                    "could not read pending dtn journal record; retaining it"
+                );
+                continue;
+            }
+        };
+
+        match dispatch_bundle(raw, hnd).await {
+            Ok(()) => {
+                if let Err(error) = journal.mark_delivered(&record).await {
                     tracing::warn!(
                         ?error,
-                        %source_eid,
-                        "could not build peer url from dtn source EID"
+                        path = ?record.path(),
+                        "dtn handler succeeded but journal cleanup failed; replay may duplicate delivery"
                     );
                 }
             }
-        }
-        Err(error) => {
-            tracing::warn!(
-                ?error,
-                "failed to decode received bundle as bp7 Bundle; bundle was already popped"
-            );
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    path = ?record.path(),
+                    "pending dtn journal dispatch failed; retaining record for later replay"
+                );
+            }
         }
     }
+    Ok(())
 }
 
 fn spawn_receiver(
     cfg: DtnConfig,
     client: reqwest::Client,
     hnd: Arc<TxImpHnd>,
+    journal: InboundJournal,
 ) -> tokio::task::AbortHandle {
     let task = tokio::spawn(async move {
         let poll_url = format!(
@@ -259,6 +314,18 @@ fn spawn_receiver(
             urlencoding::encode(&cfg.service)
         );
         loop {
+            // Replay retained records before destructively popping more data.
+            // Repeating this once per poll cycle also permits application
+            // handlers registered shortly after transport creation to consume
+            // records that were not dispatchable during the first pass.
+            if let Err(error) = replay_pending(&journal, &hnd).await {
+                tracing::error!(
+                    ?error,
+                    "dtn inbound journal replay failed; stopping receiver before further destructive pops"
+                );
+                return;
+            }
+
             // Drain the application-agent queue without sleeping between
             // bundles. Sleep only once the queue is empty or polling fails.
             loop {
@@ -283,7 +350,7 @@ fn spawn_receiver(
                     Err(error) => {
                         tracing::warn!(
                             ?error,
-                            "failed to read bounded dtn /endpoint body; bundle may already be popped"
+                            "failed to read bounded dtn /endpoint body; bundle may already be popped before journaling"
                         );
                         break;
                     }
@@ -292,7 +359,36 @@ fn spawn_receiver(
                 if raw.as_ref() == b"Nothing to receive" || raw.is_empty() {
                     break;
                 }
-                dispatch_bundle(raw, &hnd).await;
+
+                let record = match journal.persist(&raw).await {
+                    Ok(record) => record,
+                    Err(error) => {
+                        tracing::error!(
+                            ?error,
+                            "could not durably journal destructively popped dtn bundle; stopping receiver to avoid popping additional bundles"
+                        );
+                        return;
+                    }
+                };
+
+                match dispatch_bundle(raw, &hnd).await {
+                    Ok(()) => {
+                        if let Err(error) = journal.mark_delivered(&record).await {
+                            tracing::warn!(
+                                ?error,
+                                path = ?record.path(),
+                                "dtn handler succeeded but journal cleanup failed; replay may duplicate delivery"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            path = ?record.path(),
+                            "dtn dispatch failed after durable journal commit; retaining record for replay"
+                        );
+                    }
+                }
             }
 
             tokio::time::sleep(cfg.poll_interval).await;
@@ -315,7 +411,8 @@ impl TransportFactory for DtnTransportFactory {
     }
 
     fn validate_config(&self, _config: &Config) -> K2Result<()> {
-        validate_dtn_config(&self.cfg)
+        validate_dtn_config(&self.cfg)?;
+        inbound_journal_settings(&self.cfg).map(|_| ())
     }
 
     fn create(
@@ -326,6 +423,11 @@ impl TransportFactory for DtnTransportFactory {
         let cfg = self.cfg.clone();
         Box::pin(async move {
             validate_dtn_config(&cfg)?;
+            let (journal_root, journal_max_bytes) = inbound_journal_settings(&cfg)?;
+            // Journal readiness is load-bearing. Refuse to register the
+            // destructive receive endpoint if durable handoff cannot be opened.
+            let journal =
+                InboundJournal::open(journal_root, journal_max_bytes, MAX_BUNDLE_BYTES).await?;
 
             let my_url = node_url(&cfg.node_name)?;
             let hnd = TxImpHnd::new(handler);
@@ -350,7 +452,8 @@ impl TransportFactory for DtnTransportFactory {
                 .error_for_status()
                 .map_err(|e| K2Error::other_src("dtn /register returned an error status", e))?;
 
-            let receiver_abort = spawn_receiver(cfg.clone(), client.clone(), hnd.clone());
+            let receiver_abort =
+                spawn_receiver(cfg.clone(), client.clone(), hnd.clone(), journal);
 
             let imp: DynTxImp = Arc::new(DtnTxImp {
                 cfg,
