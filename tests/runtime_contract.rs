@@ -2,6 +2,7 @@
 
 use kitsune2_api::{TransportFactory, TxBaseHandler, TxHandler};
 use kitsune2_transport_dtn::{DtnConfig, DtnTransportFactory};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -21,6 +22,16 @@ fn config(port: u16, poll_interval: Duration) -> DtnConfig {
         lifetime_secs: 3600,
         poll_interval,
     }
+}
+
+fn journal_path(port: u16) -> PathBuf {
+    PathBuf::from(".kitsune2-dtn-journal")
+        .join(format!("node-1-{port}"))
+        .join("kitsune2")
+}
+
+fn cleanup_journal(port: u16) {
+    let _ = std::fs::remove_dir_all(journal_path(port));
 }
 
 async fn read_request(stream: &mut TcpStream) -> String {
@@ -58,6 +69,8 @@ async fn registration_error_status_fails_transport_creation() {
         .await
         .expect("bind test server");
     let port = listener.local_addr().expect("test address").port();
+    cleanup_journal(port);
+
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept registration");
         let request = read_request(&mut stream).await;
@@ -77,6 +90,7 @@ async fn registration_error_status_fails_transport_creation() {
 
     assert!(result.is_err(), "HTTP 500 registration must fail closed");
     server.await.expect("registration server task");
+    cleanup_journal(port);
 }
 
 #[tokio::test]
@@ -85,6 +99,7 @@ async fn dropping_transport_stops_endpoint_polling() {
         .await
         .expect("bind test server");
     let port = listener.local_addr().expect("test address").port();
+    cleanup_journal(port);
     let polls = Arc::new(AtomicUsize::new(0));
     let server_polls = polls.clone();
 
@@ -132,4 +147,75 @@ async fn dropping_transport_stops_endpoint_polling() {
     );
 
     server.abort();
+    cleanup_journal(port);
+}
+
+#[tokio::test]
+async fn retained_record_backpressures_destructive_endpoint_polling() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
+    let port = listener.local_addr().expect("test address").port();
+    cleanup_journal(port);
+    let polls = Arc::new(AtomicUsize::new(0));
+    let server_polls = polls.clone();
+
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let request = read_request(&mut stream).await;
+            if request.starts_with("GET /register?kitsune2 ") {
+                respond(&mut stream, "200 OK", "registered").await;
+            } else if request.starts_with("GET /endpoint?kitsune2 ") {
+                let poll = server_polls.fetch_add(1, Ordering::SeqCst);
+                if poll == 0 {
+                    // The bridge must journal these bytes before discovering
+                    // that they are not a valid BPv7 bundle.
+                    respond(&mut stream, "200 OK", "not-a-bp7-bundle").await;
+                } else {
+                    respond(&mut stream, "200 OK", "Nothing to receive").await;
+                }
+            } else {
+                respond(&mut stream, "404 Not Found", "").await;
+            }
+        }
+    });
+
+    let transport = DtnTransportFactory {
+        cfg: config(port, Duration::from_millis(20)),
+    }
+    .create(
+        Arc::new(kitsune2_core::default_test_builder()),
+        Arc::new(NoopTxHandler),
+    )
+    .await
+    .expect("create transport");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while polls.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("receiver should perform the first destructive endpoint poll");
+
+    // Several receiver retry cycles should replay the retained journal record
+    // locally without issuing a second destructive /endpoint request.
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        1,
+        "receiver popped another bundle while an older durable record was still blocked"
+    );
+
+    let pending = std::fs::read_dir(journal_path(port))
+        .expect("journal directory")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "bundle"))
+        .count();
+    assert_eq!(pending, 1, "failed dispatch must remain durably journaled");
+
+    drop(transport);
+    server.abort();
+    cleanup_journal(port);
 }
