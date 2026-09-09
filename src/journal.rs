@@ -1,13 +1,9 @@
 //! Durable receive-before-dispatch journal for destructively popped BPv7 bundles.
 //!
-//! This module deliberately gives journal records an opaque local identity.
-//! A journal record id is **not** an application message id and must not be used
-//! for duplicate suppression. Idempotent message identity belongs to a later
-//! protocol layer.
-//!
-//! The journal provides local crash durability and accidental-corruption
-//! detection. CRC32 is used only to detect damaged/torn local records; it is not
-//! authentication and provides no adversarial tamper resistance.
+//! Journal record identity is intentionally local and opaque. It is not an
+//! application message identity and must not be used for duplicate suppression.
+//! The journal provides crash durability plus accidental-corruption detection;
+//! its checksum is not authentication and gives no adversarial tamper resistance.
 
 use bytes::Bytes;
 use kitsune2_api::{K2Error, K2Result};
@@ -27,14 +23,9 @@ const PENDING_SUFFIX: &str = ".bundle";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RecordMetadata {
     expected_len: usize,
-    crc32: u32,
+    checksum: u32,
 }
 
-/// One opaque local journal record.
-///
-/// Its filename is a storage identity only. Equal raw bundles intentionally get
-/// distinct records; duplicate-safe application semantics are not implemented
-/// here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct JournaledBundle {
     path: PathBuf,
@@ -46,7 +37,7 @@ impl JournaledBundle {
     }
 }
 
-/// A bounded durable queue of bundles already removed from dtn7 but not yet
+/// Bounded durable queue of bundles already removed from dtn7 but not yet
 /// acknowledged as successfully dispatched to Kitsune2.
 #[derive(Clone, Debug)]
 pub(crate) struct InboundJournal {
@@ -56,11 +47,8 @@ pub(crate) struct InboundJournal {
 }
 
 impl InboundJournal {
-    /// Open or create a journal and recover any fully written temporary records
-    /// left by a crash between file sync and atomic rename.
-    ///
-    /// Ambiguous or corrupt records fail closed. A receiver must not continue
-    /// destructively popping bundles while its durable handoff state is suspect.
+    /// Open/create the journal and recover only unambiguous, fully committed
+    /// crash-temp records. Ambiguous or corrupt state fails closed.
     pub(crate) async fn open(
         root: PathBuf,
         max_pending_bytes: u64,
@@ -83,10 +71,10 @@ impl InboundJournal {
         tokio::fs::create_dir_all(&root)
             .await
             .map_err(|error| K2Error::other_src("failed to create dtn inbound journal", error))?;
-        let root_metadata = tokio::fs::metadata(&root)
+        let metadata = tokio::fs::metadata(&root)
             .await
             .map_err(|error| K2Error::other_src("failed to stat dtn inbound journal", error))?;
-        if !root_metadata.is_dir() {
+        if !metadata.is_dir() {
             return Err(K2Error::other("dtn inbound journal root is not a directory"));
         }
         set_private_directory_permissions(&root).await?;
@@ -97,23 +85,21 @@ impl InboundJournal {
             max_record_bytes,
         };
         journal.recover_complete_temps().await?;
+
         let pending_bytes = journal.pending_bytes().await?;
         if pending_bytes > max_pending_bytes {
             return Err(K2Error::other(format!(
                 "existing dtn inbound journal exceeds configured capacity: {pending_bytes} > {max_pending_bytes} bytes"
             )));
         }
-        // Force a structural scan now so malformed/oversized pending records
-        // prevent endpoint registration rather than surfacing after more pops.
+
+        // Force a structural scan before endpoint registration so malformed
+        // pending state cannot coexist with continued destructive receives.
         let _ = journal.pending().await?;
         Ok(journal)
     }
 
-    /// Persist raw bytes before any BPv7 decoding or Kitsune2 dispatch.
-    ///
-    /// The record is written to a unique temporary file, permission-hardened,
-    /// file-synced, atomically renamed into the pending set, and then the
-    /// containing directory is synced where supported.
+    /// Persist raw bytes before BPv7 decoding or Kitsune2 dispatch.
     pub(crate) async fn persist(&self, raw: &Bytes) -> K2Result<JournaledBundle> {
         if raw.len() > self.max_record_bytes {
             return Err(K2Error::other(format!(
@@ -131,11 +117,9 @@ impl InboundJournal {
             )));
         }
 
-        let crc32 = crc32fast::hash(raw);
-        // create_new is the final collision guard. The counter makes collision
-        // extremely unlikely, but correctness does not depend on probability.
+        let checksum = checksum32(raw);
         for _ in 0..32 {
-            let stem = new_record_stem(raw.len(), crc32);
+            let stem = new_record_stem(raw.len(), checksum);
             let temp_path = self.root.join(format!("{stem}{TEMP_SUFFIX}"));
             let pending_path = self.root.join(format!("{stem}{PENDING_SUFFIX}"));
 
@@ -168,7 +152,7 @@ impl InboundJournal {
             })?;
             drop(file);
 
-            // Never permit rename-overwrite semantics to decide correctness.
+            // Never rely on platform rename-overwrite behavior for correctness.
             if path_exists(&pending_path).await? {
                 return Err(K2Error::other(
                     "dtn inbound journal pending-record collision detected",
@@ -180,7 +164,6 @@ impl InboundJournal {
                     K2Error::other_src("failed to commit dtn inbound journal record", error)
                 })?;
             sync_directory(&self.root)?;
-
             return Ok(JournaledBundle { path: pending_path });
         }
 
@@ -189,10 +172,7 @@ impl InboundJournal {
         ))
     }
 
-    /// List pending records in deterministic filename order.
-    ///
-    /// Reserved-name corruption fails closed instead of being skipped. Unknown
-    /// unrelated files remain outside the journal namespace and are ignored.
+    /// List committed records in deterministic storage order.
     pub(crate) async fn pending(&self) -> K2Result<Vec<JournaledBundle>> {
         let mut records = Vec::new();
         let mut entries = tokio::fs::read_dir(&self.root)
@@ -209,6 +189,7 @@ impl InboundJournal {
             if !file_name.starts_with(RECORD_PREFIX) || !file_name.ends_with(PENDING_SUFFIX) {
                 continue;
             }
+
             let record_meta = parse_record_metadata(file_name, PENDING_SUFFIX).ok_or_else(|| {
                 K2Error::other(format!(
                     "malformed dtn inbound journal pending record name: {file_name}"
@@ -238,7 +219,6 @@ impl InboundJournal {
                     metadata.len(), record_meta.expected_len
                 )));
             }
-
             records.push(JournaledBundle { path: entry.path() });
         }
 
@@ -246,23 +226,17 @@ impl InboundJournal {
         Ok(records)
     }
 
-    /// Read one pending record and verify its length and accidental-corruption
-    /// checksum before returning it for dispatch.
+    /// Read a committed record and verify its length/checksum before dispatch.
     pub(crate) async fn read(&self, record: &JournaledBundle) -> K2Result<Bytes> {
         let record_meta = self.validate_record_path(record)?;
-        let file_type = tokio::fs::symlink_metadata(&record.path)
+        let metadata = tokio::fs::symlink_metadata(&record.path)
             .await
-            .map_err(|error| K2Error::other_src("failed to inspect dtn journal record", error))?
-            .file_type();
-        if !file_type.is_file() {
+            .map_err(|error| K2Error::other_src("failed to inspect dtn journal record", error))?;
+        if !metadata.file_type().is_file() {
             return Err(K2Error::other(
                 "dtn inbound journal pending path is not a regular file",
             ));
         }
-
-        let metadata = tokio::fs::metadata(&record.path).await.map_err(|error| {
-            K2Error::other_src("failed to stat dtn inbound journal record", error)
-        })?;
         if metadata.len() != record_meta.expected_len as u64
             || record_meta.expected_len > self.max_record_bytes
         {
@@ -279,11 +253,11 @@ impl InboundJournal {
                 "dtn inbound journal record length changed during read",
             ));
         }
-        let actual_crc32 = crc32fast::hash(&bytes);
-        if actual_crc32 != record_meta.crc32 {
+        let actual_checksum = checksum32(&bytes);
+        if actual_checksum != record_meta.checksum {
             return Err(K2Error::other(format!(
-                "dtn inbound journal record checksum mismatch: {actual_crc32:08x} != {:08x}",
-                record_meta.crc32
+                "dtn inbound journal record checksum mismatch: {actual_checksum:08x} != {:08x}",
+                record_meta.checksum
             )));
         }
         Ok(Bytes::from(bytes))
@@ -334,6 +308,7 @@ impl InboundJournal {
             if !file_name.starts_with(RECORD_PREFIX) || !file_name.ends_with(TEMP_SUFFIX) {
                 continue;
             }
+
             let record_meta = parse_record_metadata(file_name, TEMP_SUFFIX).ok_or_else(|| {
                 K2Error::other(format!(
                     "malformed dtn inbound journal temp record name: {file_name}"
@@ -367,7 +342,7 @@ impl InboundJournal {
             let bytes = tokio::fs::read(entry.path()).await.map_err(|error| {
                 K2Error::other_src("failed to verify dtn journal temp record", error)
             })?;
-            if crc32fast::hash(&bytes) != record_meta.crc32 {
+            if checksum32(&bytes) != record_meta.checksum {
                 return Err(K2Error::other(format!(
                     "corrupt dtn journal temp record retained at {:?}",
                     entry.path()
@@ -427,29 +402,46 @@ impl InboundJournal {
     }
 }
 
-fn new_record_stem(raw_len: usize, crc32: u32) -> String {
+fn new_record_stem(raw_len: usize, checksum: u32) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     let counter = RECORD_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!(
-        "{RECORD_PREFIX}{nanos:032x}-{:08x}-{counter:016x}-{raw_len}-{crc32:08x}",
+        "{RECORD_PREFIX}{nanos:032x}-{:08x}-{counter:016x}-{raw_len}-{checksum:08x}",
         std::process::id()
     )
 }
 
 fn parse_record_metadata(file_name: &str, suffix: &str) -> Option<RecordMetadata> {
     let stem = file_name.strip_prefix(RECORD_PREFIX)?.strip_suffix(suffix)?;
-    let (prefix, crc32_hex) = stem.rsplit_once('-')?;
+    let (prefix, checksum_hex) = stem.rsplit_once('-')?;
     let (_, len) = prefix.rsplit_once('-')?;
-    if crc32_hex.len() != 8 {
+    if checksum_hex.len() != 8 {
         return None;
     }
     Some(RecordMetadata {
         expected_len: len.parse().ok()?,
-        crc32: u32::from_str_radix(crc32_hex, 16).ok()?,
+        checksum: u32::from_str_radix(checksum_hex, 16).ok()?,
     })
+}
+
+/// Small, dependency-free CRC32 (IEEE) used only for accidental-corruption
+/// detection of local journal bytes.
+fn checksum32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffff_u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 
 async fn path_exists(path: &Path) -> K2Result<bool> {
@@ -497,8 +489,8 @@ fn sync_directory(path: &Path) -> K2Result<()> {
 #[cfg(not(unix))]
 fn sync_directory(_path: &Path) -> K2Result<()> {
     // Directory fsync is not portable through std on all supported platforms.
-    // File contents are still sync_all()'d before rename; the protocol docs do
-    // not claim Unix-equivalent rename durability on non-Unix filesystems.
+    // File contents are still sync_all()'d before rename; no Unix-equivalent
+    // rename-durability claim is made on other filesystems.
     Ok(())
 }
 
@@ -522,8 +514,13 @@ mod tests {
         format!(
             "record-test-{}-{:08x}{TEMP_SUFFIX}",
             raw.len(),
-            crc32fast::hash(raw)
+            checksum32(raw)
         )
+    }
+
+    #[test]
+    fn checksum_has_known_ieee_vector() {
+        assert_eq!(checksum32(b"123456789"), 0xcbf4_3926);
     }
 
     #[tokio::test]
@@ -542,12 +539,8 @@ mod tests {
         let pending = reopened.pending().await.expect("pending");
         assert_eq!(pending.len(), 1);
         assert_eq!(reopened.read(&pending[0]).await.unwrap(), raw);
-        reopened
-            .mark_delivered(&pending[0])
-            .await
-            .expect("mark delivered");
+        reopened.mark_delivered(&pending[0]).await.unwrap();
         assert!(reopened.pending().await.unwrap().is_empty());
-
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -555,62 +548,51 @@ mod tests {
     async fn identical_raw_bundles_get_distinct_journal_records() {
         let root = test_root("duplicates");
         let raw = Bytes::from_static(b"same-bundle");
-        let journal = InboundJournal::open(root.clone(), 1024, 512)
-            .await
-            .expect("open journal");
-
-        let first = journal.persist(&raw).await.expect("first");
-        let second = journal.persist(&raw).await.expect("second");
+        let journal = InboundJournal::open(root.clone(), 1024, 512).await.unwrap();
+        let first = journal.persist(&raw).await.unwrap();
+        let second = journal.persist(&raw).await.unwrap();
         assert_ne!(first.path(), second.path());
         assert_eq!(journal.pending().await.unwrap().len(), 2);
-
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[tokio::test]
     async fn capacity_limit_fails_closed() {
         let root = test_root("capacity");
-        let journal = InboundJournal::open(root.clone(), 8, 8)
-            .await
-            .expect("open journal");
-
+        let journal = InboundJournal::open(root.clone(), 8, 8).await.unwrap();
         journal
             .persist(&Bytes::from_static(b"12345678"))
             .await
-            .expect("first record fits");
+            .unwrap();
         assert!(journal.persist(&Bytes::from_static(b"x")).await.is_err());
-
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[tokio::test]
     async fn complete_temp_record_is_verified_and_promoted_on_reopen() {
         let root = test_root("temp-recovery");
-        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(&root).unwrap();
         let raw = b"abc";
         let temp = root.join(temp_name(raw));
-        let mut file = std::fs::File::create(&temp).expect("create temp");
-        file.write_all(raw).expect("write temp");
-        file.sync_all().expect("sync temp");
+        let mut file = std::fs::File::create(&temp).unwrap();
+        file.write_all(raw).unwrap();
+        file.sync_all().unwrap();
         drop(file);
 
-        let journal = InboundJournal::open(root.clone(), 1024, 512)
-            .await
-            .expect("recover journal");
-        let pending = journal.pending().await.expect("pending");
+        let journal = InboundJournal::open(root.clone(), 1024, 512).await.unwrap();
+        let pending = journal.pending().await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(journal.read(&pending[0]).await.unwrap(), Bytes::from_static(raw));
-
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[tokio::test]
     async fn incomplete_temp_record_stops_recovery() {
         let root = test_root("incomplete-temp");
-        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(&root).unwrap();
         let raw = b"abcdef";
         let temp = root.join(temp_name(raw));
-        std::fs::write(&temp, b"abc").expect("write partial temp");
+        std::fs::write(&temp, b"abc").unwrap();
 
         assert!(InboundJournal::open(root.clone(), 1024, 512).await.is_err());
         assert!(temp.exists(), "forensic temp record must be retained");
@@ -621,12 +603,9 @@ mod tests {
     async fn pending_record_bitflip_is_detected_before_dispatch() {
         let root = test_root("bitflip");
         let raw = Bytes::from_static(b"abcdef");
-        let journal = InboundJournal::open(root.clone(), 1024, 512)
-            .await
-            .expect("open journal");
-        let record = journal.persist(&raw).await.expect("persist");
-        std::fs::write(record.path(), b"abcdeg").expect("corrupt pending record");
-
+        let journal = InboundJournal::open(root.clone(), 1024, 512).await.unwrap();
+        let record = journal.persist(&raw).await.unwrap();
+        std::fs::write(record.path(), b"abcdeg").unwrap();
         assert!(journal.read(&record).await.is_err());
         assert!(record.path().exists(), "corrupt record must be retained");
         std::fs::remove_dir_all(root).expect("cleanup");
@@ -635,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_refuses_temp_pending_collision() {
         let root = test_root("collision");
-        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(&root).unwrap();
         let raw = b"abc";
         let temp_name = temp_name(raw);
         let temp = root.join(&temp_name);
@@ -644,8 +623,8 @@ mod tests {
             temp_name.strip_suffix(TEMP_SUFFIX).unwrap(),
             PENDING_SUFFIX
         ));
-        std::fs::write(&temp, raw).expect("write temp");
-        std::fs::write(&pending, raw).expect("write pending");
+        std::fs::write(&temp, raw).unwrap();
+        std::fs::write(&pending, raw).unwrap();
 
         assert!(InboundJournal::open(root.clone(), 1024, 512).await.is_err());
         assert!(temp.exists());
@@ -657,14 +636,11 @@ mod tests {
     #[tokio::test]
     async fn journal_directory_and_records_are_private() {
         let root = test_root("permissions");
-        let journal = InboundJournal::open(root.clone(), 1024, 512)
-            .await
-            .expect("open journal");
+        let journal = InboundJournal::open(root.clone(), 1024, 512).await.unwrap();
         let record = journal
             .persist(&Bytes::from_static(b"secret-ish-payload"))
             .await
-            .expect("persist");
-
+            .unwrap();
         let dir_mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
         let file_mode = std::fs::metadata(record.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
