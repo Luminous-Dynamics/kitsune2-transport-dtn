@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Luminous Dynamics
 # SPDX-License-Identifier: Apache-2.0
 # Focused exact-head qualification for the durable DTN receive/journal boundary.
+# Re-triggered after the pinned Rust 1.96 formatting repair.
 
 set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
