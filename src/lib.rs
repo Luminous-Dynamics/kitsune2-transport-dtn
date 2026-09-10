@@ -254,7 +254,9 @@ async fn read_bounded_body(mut response: reqwest::Response) -> K2Result<Bytes> {
 
 async fn dispatch_bundle(raw: Bytes, hnd: &Arc<TxImpHnd>) -> K2Result<()> {
     let bundle = bp7::Bundle::try_from(raw.to_vec()).map_err(|error| {
-        K2Error::other(format!("failed to decode received bundle as bp7 Bundle: {error:?}"))
+        K2Error::other(format!(
+            "failed to decode received bundle as bp7 Bundle: {error:?}"
+        ))
     })?;
     let payload = extract_payload(&bundle)
         .ok_or_else(|| K2Error::other("received BPv7 bundle without a payload block"))?;
@@ -455,8 +457,7 @@ impl TransportFactory for DtnTransportFactory {
                     K2Error::other_src("dtn /register returned an error status", error)
                 })?;
 
-            let receiver_abort =
-                spawn_receiver(cfg.clone(), client.clone(), hnd.clone(), journal);
+            let receiver_abort = spawn_receiver(cfg.clone(), client.clone(), hnd.clone(), journal);
             let imp: DynTxImp = Arc::new(DtnTxImp {
                 cfg,
                 client,
