@@ -75,7 +75,9 @@ impl InboundJournal {
             .await
             .map_err(|error| K2Error::other_src("failed to stat dtn inbound journal", error))?;
         if !metadata.is_dir() {
-            return Err(K2Error::other("dtn inbound journal root is not a directory"));
+            return Err(K2Error::other(
+                "dtn inbound journal root is not a directory",
+            ));
         }
         set_private_directory_permissions(&root).await?;
 
@@ -179,9 +181,11 @@ impl InboundJournal {
             .await
             .map_err(|error| K2Error::other_src("failed to read dtn inbound journal", error))?;
 
-        while let Some(entry) = entries.next_entry().await.map_err(|error| {
-            K2Error::other_src("failed to enumerate dtn inbound journal", error)
-        })? {
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| K2Error::other_src("failed to enumerate dtn inbound journal", error))?
+        {
             let file_name = entry.file_name();
             let Some(file_name) = file_name.to_str() else {
                 continue;
@@ -190,11 +194,12 @@ impl InboundJournal {
                 continue;
             }
 
-            let record_meta = parse_record_metadata(file_name, PENDING_SUFFIX).ok_or_else(|| {
-                K2Error::other(format!(
-                    "malformed dtn inbound journal pending record name: {file_name}"
-                ))
-            })?;
+            let record_meta =
+                parse_record_metadata(file_name, PENDING_SUFFIX).ok_or_else(|| {
+                    K2Error::other(format!(
+                        "malformed dtn inbound journal pending record name: {file_name}"
+                    ))
+                })?;
             if record_meta.expected_len > self.max_record_bytes {
                 return Err(K2Error::other(format!(
                     "dtn inbound journal pending record declares {} bytes above max {}",
@@ -216,7 +221,8 @@ impl InboundJournal {
             if metadata.len() != record_meta.expected_len as u64 {
                 return Err(K2Error::other(format!(
                     "dtn inbound journal pending record length mismatch for {file_name}: {} != {}",
-                    metadata.len(), record_meta.expected_len
+                    metadata.len(),
+                    record_meta.expected_len
                 )));
             }
             records.push(JournaledBundle { path: entry.path() });
@@ -269,9 +275,11 @@ impl InboundJournal {
     /// restart. That is intentional at-least-once behavior, not exactly-once.
     pub(crate) async fn mark_delivered(&self, record: &JournaledBundle) -> K2Result<()> {
         let _ = self.validate_record_path(record)?;
-        tokio::fs::remove_file(&record.path).await.map_err(|error| {
-            K2Error::other_src("failed to remove delivered dtn journal record", error)
-        })?;
+        tokio::fs::remove_file(&record.path)
+            .await
+            .map_err(|error| {
+                K2Error::other_src("failed to remove delivered dtn journal record", error)
+            })?;
         sync_directory(&self.root)?;
         Ok(())
     }
@@ -298,9 +306,11 @@ impl InboundJournal {
             .map_err(|error| K2Error::other_src("failed to read dtn inbound journal", error))?;
         let mut promoted_any = false;
 
-        while let Some(entry) = entries.next_entry().await.map_err(|error| {
-            K2Error::other_src("failed to enumerate dtn inbound journal", error)
-        })? {
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| K2Error::other_src("failed to enumerate dtn inbound journal", error))?
+        {
             let file_name = entry.file_name();
             let Some(file_name) = file_name.to_str() else {
                 continue;
@@ -335,7 +345,9 @@ impl InboundJournal {
             if metadata.len() != record_meta.expected_len as u64 {
                 return Err(K2Error::other(format!(
                     "incomplete dtn journal temp record retained at {:?}: {} != {} bytes",
-                    entry.path(), metadata.len(), record_meta.expected_len
+                    entry.path(),
+                    metadata.len(),
+                    record_meta.expected_len
                 )));
             }
 
@@ -378,9 +390,11 @@ impl InboundJournal {
             .await
             .map_err(|error| K2Error::other_src("failed to read dtn inbound journal", error))?;
 
-        while let Some(entry) = entries.next_entry().await.map_err(|error| {
-            K2Error::other_src("failed to enumerate dtn inbound journal", error)
-        })? {
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| K2Error::other_src("failed to enumerate dtn inbound journal", error))?
+        {
             let file_name = entry.file_name();
             let Some(file_name) = file_name.to_str() else {
                 continue;
@@ -415,7 +429,9 @@ fn new_record_stem(raw_len: usize, checksum: u32) -> String {
 }
 
 fn parse_record_metadata(file_name: &str, suffix: &str) -> Option<RecordMetadata> {
-    let stem = file_name.strip_prefix(RECORD_PREFIX)?.strip_suffix(suffix)?;
+    let stem = file_name
+        .strip_prefix(RECORD_PREFIX)?
+        .strip_suffix(suffix)?;
     let (prefix, checksum_hex) = stem.rsplit_once('-')?;
     let (_, len) = prefix.rsplit_once('-')?;
     if checksum_hex.len() != 8 {
@@ -459,7 +475,9 @@ async fn path_exists(path: &Path) -> K2Result<bool> {
 async fn set_private_directory_permissions(path: &Path) -> K2Result<()> {
     tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
         .await
-        .map_err(|error| K2Error::other_src("failed to protect dtn inbound journal directory", error))
+        .map_err(|error| {
+            K2Error::other_src("failed to protect dtn inbound journal directory", error)
+        })
 }
 
 #[cfg(not(unix))]
@@ -582,7 +600,10 @@ mod tests {
         let journal = InboundJournal::open(root.clone(), 1024, 512).await.unwrap();
         let pending = journal.pending().await.unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(journal.read(&pending[0]).await.unwrap(), Bytes::from_static(raw));
+        assert_eq!(
+            journal.read(&pending[0]).await.unwrap(),
+            Bytes::from_static(raw)
+        );
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -642,7 +663,11 @@ mod tests {
             .await
             .unwrap();
         let dir_mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
-        let file_mode = std::fs::metadata(record.path()).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(record.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
         std::fs::remove_dir_all(root).expect("cleanup");
