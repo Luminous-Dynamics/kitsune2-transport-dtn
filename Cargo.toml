@@ -6,6 +6,10 @@ license = "Apache-2.0"
 description = "A Kitsune2 transport backed by BPv7/DTN store-and-forward instead of WebRTC"
 repository = "https://github.com/Luminous-Dynamics/kitsune2-transport-dtn"
 
+[features]
+default = []
+real-dtn-tests = []
+
 [dependencies]
 kitsune2_api = { git = "https://github.com/holochain/kitsune2.git", rev = "62cf3446e829eaed7f3948ed29eff6dfb712413c" }
 bp7 = { version = "0.10.7", default-features = false }
@@ -18,3 +22,18 @@ urlencoding = "2"
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 kitsune2_core = { git = "https://github.com/holochain/kitsune2.git", rev = "62cf3446e829eaed7f3948ed29eff6dfb712413c" }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["real-dtn-tests"]
+
+[[test]]
+name = "payload_regression"
+path = "tests/payload_regression.rs"
+required-features = ["real-dtn-tests"]
+
+[[test]]
+name = "harnessed_smoke"
+path = "tests/harnessed_smoke.rs"
+required-features = ["real-dtn-tests"]
