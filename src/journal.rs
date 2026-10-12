@@ -670,6 +670,11 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "child test harness did not execute the lock probe: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
 
         drop(first);
         std::fs::remove_dir_all(root).expect("cleanup");
