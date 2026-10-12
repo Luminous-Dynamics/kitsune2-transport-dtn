@@ -524,13 +524,6 @@ async fn acquire_owner_lock(root: &Path) -> K2Result<Arc<File>> {
                 "dtn inbound journal owner lock changed while opening",
             ));
         }
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|error| {
-                K2Error::other_src(
-                    "failed to protect dtn inbound journal owner lock",
-                    error,
-                )
-            })?;
     }
 
     match file.try_lock() {
@@ -547,6 +540,17 @@ async fn acquire_owner_lock(root: &Path) -> K2Result<Arc<File>> {
             ));
         }
     }
+
+    // Only the process that has acquired exclusive ownership may normalize
+    // metadata on a pre-existing lock file.
+    #[cfg(unix)]
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| {
+            K2Error::other_src(
+                "failed to protect dtn inbound journal owner lock",
+                error,
+            )
+        })?;
 
     Ok(Arc::new(file))
 }
