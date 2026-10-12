@@ -638,10 +638,14 @@ mod tests {
             .await
             .expect("first owner should open journal");
 
-        let second = InboundJournal::open(root.clone(), 1024, 512).await;
+        let second_error = InboundJournal::open(root.clone(), 1024, 512)
+            .await
+            .expect_err("a second receiver must not open the same journal root");
         assert!(
-            second.is_err(),
-            "a second receiver must not open the same journal root"
+            second_error
+                .to_string()
+                .contains("already owned by another receiver"),
+            "expected explicit owner-lock contention; got {second_error}"
         );
 
         drop(first);
