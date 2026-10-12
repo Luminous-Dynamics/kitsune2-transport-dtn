@@ -30,8 +30,44 @@ fn journal_path(port: u16) -> PathBuf {
         .join("kitsune2")
 }
 
-fn cleanup_journal(port: u16) {
-    let _ = std::fs::remove_dir_all(journal_path(port));
+async fn cleanup_journal(port: u16) {
+    let root = journal_path(port);
+    let lock_path = root.join(".owner.lock");
+
+    // Never remove a journal directory while its owner lock is held. Wait for
+    // an aborted receiver task to release its file handle before test cleanup.
+    if lock_path.exists() {
+        let mut unlocked = false;
+        for _ in 0..200 {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+            {
+                Ok(file) => match file.try_lock() {
+                    Ok(()) => {
+                        drop(file);
+                        unlocked = true;
+                        break;
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(std::fs::TryLockError::Error(error)) => {
+                        panic!("failed to check journal owner lock during cleanup: {error}");
+                    }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    unlocked = true;
+                    break;
+                }
+                Err(error) => panic!("failed to open journal owner lock during cleanup: {error}"),
+            }
+        }
+        assert!(unlocked, "journal owner lock remained held during cleanup");
+    }
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 async fn read_request(stream: &mut TcpStream) -> String {
@@ -69,7 +105,7 @@ async fn registration_error_status_fails_transport_creation() {
         .await
         .expect("bind test server");
     let port = listener.local_addr().expect("test address").port();
-    cleanup_journal(port);
+    cleanup_journal(port).await;
 
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept registration");
@@ -90,7 +126,7 @@ async fn registration_error_status_fails_transport_creation() {
 
     assert!(result.is_err(), "HTTP 500 registration must fail closed");
     server.await.expect("registration server task");
-    cleanup_journal(port);
+    cleanup_journal(port).await;
 }
 
 #[tokio::test]
@@ -99,7 +135,7 @@ async fn dropping_transport_stops_endpoint_polling() {
         .await
         .expect("bind test server");
     let port = listener.local_addr().expect("test address").port();
-    cleanup_journal(port);
+    cleanup_journal(port).await;
     let polls = Arc::new(AtomicUsize::new(0));
     let server_polls = polls.clone();
 
@@ -147,7 +183,7 @@ async fn dropping_transport_stops_endpoint_polling() {
     );
 
     server.abort();
-    cleanup_journal(port);
+    cleanup_journal(port).await;
 }
 
 #[tokio::test]
@@ -156,7 +192,7 @@ async fn retained_record_backpressures_destructive_endpoint_polling() {
         .await
         .expect("bind test server");
     let port = listener.local_addr().expect("test address").port();
-    cleanup_journal(port);
+    cleanup_journal(port).await;
     let polls = Arc::new(AtomicUsize::new(0));
     let server_polls = polls.clone();
 
@@ -217,5 +253,5 @@ async fn retained_record_backpressures_destructive_endpoint_polling() {
 
     drop(transport);
     server.abort();
-    cleanup_journal(port);
+    cleanup_journal(port).await;
 }
