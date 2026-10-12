@@ -41,7 +41,7 @@ impl JournaledBundle {
 
 /// Bounded durable queue of bundles already removed from dtn7 but not yet
 /// acknowledged as successfully dispatched to Kitsune2.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct InboundJournal {
     root: PathBuf,
     max_pending_bytes: u64,
