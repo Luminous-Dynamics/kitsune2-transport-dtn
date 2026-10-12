@@ -120,7 +120,41 @@ This design proposal does not change PR #4's current global backpressure behavio
 - Mycelix may provide principal/key bindings, capabilities, and revocation state, but a distributed governance action MUST NOT be synchronously required for every packet. Freshness requirements for cached trust state are policy-dependent; control-class traffic fails closed if required authority/revocation state is stale.
 - COSE_Sign1 provides signature integrity/authentication only when the credential-to-principal binding is trusted. It does not encrypt the payload. Apply BPSec where bundle-layer security is required, and separately specify any end-to-end encryption/key-management profile.
 
-## 8. Required qualification before implementation is called complete
+## 8. Normative state table and crash behavior
+
+This table is the required protocol state model. Implementations MUST persist the named durable transitions before exposing the corresponding disposition. A transition failing to commit leaves the previous durable state authoritative. A process restart MUST resume from durable state, not from an inferred log line or a volatile counter.
+
+| Durable state | Event and guard | Required action before advancing | Next state / retry behavior |
+|---|---|---|---|
+| `raw_journaled` | Complete bundle bytes have been committed to the local receive journal | Decode within the configured bound; parse exact v1 envelope; validate signature, credential-to-principal binding, digest, class, expiry, and policy | `verified`; invalid content goes to bounded `quarantine_committed` or remains blocking if quarantine cannot commit |
+| `verified` | No existing (`sender_id`, `message_id`) entry and all quotas allow admission | Atomically and durably reserve the dedup key, envelope digest, immutable received bytes/reference, expiry, and initial inbox status before dispatch | `inbox_reserved`; if reserve fails, do not dispatch |
+| `verified` | Existing dedup key with the same envelope digest | Read the durable prior status/receipt; do not call the handler merely because a duplicate bundle arrived | `duplicate_observed`; return/retry the persisted receipt or current persisted disposition |
+| `verified` | Existing dedup key but a different envelope digest | Persist conflict diagnosis and bounded quarantine state; do not dispatch the conflicting variant | `quarantine_committed`; emit conflict rejection only if the sender credential is authenticated and policy allows a response |
+| `inbox_reserved` or `dispatch_pending` | Worker attempts dispatch | Preserve the durable inbox entry and original message ID across attempts. Apply application-specific idempotency key where the receiving application supports one | Remains pending until handler call returns success; on failure, retry according to local bounded backoff and surface diagnostics |
+| `inbox_reserved` or `dispatch_pending` | Process crashes before or during handler execution | On restart, retry pending dispatch; do not infer that it executed or did not execute from absence of a completion marker | At-least-once; duplicate side effects remain possible unless the application operation is transactional or idempotent |
+| `dispatch_pending` | Handler returns success | Durably store `handler_accepted` status and a stable signed receipt before reporting that disposition to the sender | `receipt_durable`; this is not an application-commit claim |
+| `receipt_durable` | Receipt transmission is attempted but lost, delayed, or duplicated | Retain the exact signed receipt bytes and retry them; duplicate receipt delivery must be idempotent | Remains `receipt_durable` until retained/acknowledged under the selected receipt-transport policy |
+| `receipt_durable` | Retiring local raw journal record | Delete/retire the raw record only after durable inbox/dedup state and the corresponding receipt state exist; sync the relevant storage boundary | `retired`; recovery must not require the raw record to reconstruct a committed receipt |
+| Any state with an invalid/unknown clock or stale required authority state | Message is time-sensitive or authority-bearing | Fail closed for dispatch; keep durable evidence and report clock/trust freshness in diagnostics | Remain pending or transition to durable quarantine/rejection according to policy; never treat unknown time as fresh |
+| Any state | Journal, inbox, receipt store, or bounded quarantine has no capacity / write fails | Do not dispatch an unreserved message, prune unexpired dedup entries, overwrite evidence, or claim a receipt that was not committed | Pause the affected lane and emit a bounded, observable fault; operator recovery must be explicit |
+
+### Crash ordering rules
+
+1. **Before raw journal commit:** the daemon's destructive `/endpoint` pop can still lose a bundle if the body read, process, or storage path fails. This remains a known limitation of the current dtn7 API.
+2. **After raw journal commit but before inbox reservation:** restart re-reads the raw journal and repeats validation; no handler dispatch has occurred.
+3. **After inbox reservation but before handler success:** the durable `dispatch_pending` state is retried. The handler may not have seen the message, or it may have partially acted; do not infer which from the crash.
+4. **After handler success but before the handler-accepted marker/receipt is durably stored:** redelivery may occur. The handler-accepted receipt MUST NOT be fabricated from memory or logs after restart.
+5. **After receipt is durably stored but before it is sent:** resend the same signed receipt bytes. The receiver MUST NOT create a new receipt ID for a retry of the same persisted transition.
+6. **After receipt transmission but before local retirement:** a restart may retransmit the same receipt; the sender processes repeated receipts idempotently.
+7. `application_committed` is unreachable from the current Kitsune2 transport alone. Only an application adapter with a defined durable transaction or idempotent command contract may emit that disposition.
+
+### Quarantine is a durability boundary
+
+Quarantine is not “delete and log.” A poison, invalid, or conflicting record may leave the active dispatch lane only after a bounded durable quarantine record containing the original bytes (or an immutable archive reference plus digest), observed reason, relevant identity/digest when trusted, and transition state has committed. If quarantine commit fails or its quota is exhausted, stop destructive polling for that lane and emit an operator-visible health failure. Never respond to unauthenticated input in a way that amplifies traffic; an authenticated, policy-approved sender may receive a stable rejection receipt after that receipt is durable.
+
+A lane is only independently resumable if storage, counters, retention, and scheduler isolation for that lane are separately bounded and tested. Until then, global head-of-line blocking is the honest behavior; this spec does not promise that unrelated traffic will continue around a poison record.
+
+## 9. Required qualification before implementation is called complete
 
 The test-vector file is the canonical byte-level fixture for this proposal. A future implementation must consume it in automated tests rather than regenerate expected values with the code under test.
 
