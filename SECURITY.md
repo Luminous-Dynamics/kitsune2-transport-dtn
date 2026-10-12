@@ -8,6 +8,14 @@ The adapter talks only to a `dtn7-rs` HTTP API bound on `127.0.0.1`. The local d
 
 A successful `/send` or `/register` response means only that the local daemon accepted the request. It does not prove remote delivery or remote authorization.
 
+## Journal ownership
+
+The receive journal uses a persistent `.owner.lock` file and an exclusive operating-system file lock. The lock is acquired before endpoint registration and is retained while any journal handle is alive. If another transport instance or process opens the same journal root, it must fail closed before it can register another destructive receive endpoint.
+
+The lock file is not a message record and must not be unlinked or replaced while an owner may be active. On Unix, the journal directory is normalized to `0700` and the lock file to `0600`. This coordinates cooperating instances of this implementation; it is not protection against a hostile process with the same account's filesystem permissions or an administrator who can replace the directory.
+
+The single-owner guarantee depends on the underlying filesystem honoring the platform's file-lock semantics. Network, FUSE, and shared filesystems have not been qualified for this repository's lock behavior. Use a tested local filesystem until a specific alternate filesystem is independently qualified. Failure to inspect or acquire the lock prevents journal recovery and endpoint registration.
+
 ## Peer identity
 
 The adapter maps a BPv7 source EID of the form `dtn://<node>/` into a nominal Kitsune2 URL. This is a logical routing identity, not cryptographic authentication.
