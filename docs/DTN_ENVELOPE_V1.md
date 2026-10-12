@@ -120,6 +120,16 @@ This design proposal does not change PR #4's current global backpressure behavio
 - Mycelix may provide principal/key bindings, capabilities, and revocation state, but a distributed governance action MUST NOT be synchronously required for every packet. Freshness requirements for cached trust state are policy-dependent; control-class traffic fails closed if required authority/revocation state is stale.
 - COSE_Sign1 provides signature integrity/authentication only when the credential-to-principal binding is trusted. It does not encrypt the payload. Apply BPSec where bundle-layer security is required, and separately specify any end-to-end encryption/key-management profile.
 
+### Delay-tolerant payload gate
+
+Every deployment MUST maintain a closed local allowlist that maps each `payload_type` to permitted traffic classes, required handler semantics, maximum size, expiry policy, and whether session freshness is required. Unknown `payload_type` values MUST be rejected; the signed media-type field is a dispatch hint, not permission to execute. There is no wildcard default.
+
+The current [Xenia Wire specification](https://github.com/Luminous-Dynamics/xenia-wire/blob/main/SPEC.md#5-replay-window) defines a receiver-configured sliding replay window `W ∈ {64, 128, 256, 512, 1024}` (default 64, agreed out-of-band) and a previous-key rekey grace period whose default is 5 seconds. A delayed or reordered session-bound frame can be rejected as too old even when its AEAD tag is valid; a message arriving after its old session key's grace period can no longer be opened under that previous key. Envelope-level signature verification does not refresh that session or reset its sequence state.
+
+Therefore, an adapter MUST classify session-bound Xenia frames and input events as ephemeral by default and MUST NOT feed a DTN-delayed copy into an expired Xenia session as if it were current. A deployment may relax this only with a separately specified, tested Xenia/DTN profile that preserves nonce uniqueness, key-epoch semantics, replay policy, consent/revocation semantics, and expiry under arbitrary delay and reordering. This proposal does not define such a profile.
+
+Durable messages SHOULD be session-independent application objects, authenticated with the durable identity/capability policy above. Authority-bearing objects still require application-level scope, monotonic authority epoch or sequence, expiry, and revocation checks. A durable revocation or consent change should be represented as its own signed object with explicit ordering semantics, not replayed as an old session-bound control frame. If payload confidentiality is required, specify independent end-to-end encryption/key management or an appropriate BPSec profile; COSE signing alone provides no confidentiality.
+
 ## 8. Normative state table and crash behavior
 
 This table is the required protocol state model. Implementations MUST persist the named durable transitions before exposing the corresponding disposition. A transition failing to commit leaves the previous durable state authoritative. A process restart MUST resume from durable state, not from an inferred log line or a volatile counter.
