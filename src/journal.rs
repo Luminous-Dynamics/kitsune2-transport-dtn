@@ -648,6 +648,51 @@ mod tests {
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
+    #[tokio::test]
+    async fn owner_lock_is_enforced_across_processes() {
+        let root = test_root("owner-lock-subprocess");
+        let first = InboundJournal::open(root.clone(), 1024, 512)
+            .await
+            .expect("parent should own journal");
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "journal::tests::owner_lock_child_process_probe",
+                "--nocapture",
+            ])
+            .env("KITSUNE2_DTN_OWNER_LOCK_TEST_ROOT", &root)
+            .output()
+            .expect("spawn child test process");
+        assert!(
+            output.status.success(),
+            "child lock probe failed; stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        drop(first);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn owner_lock_child_process_probe() {
+        let Some(root) = std::env::var_os("KITSUNE2_DTN_OWNER_LOCK_TEST_ROOT") else {
+            // This probe is also discovered by the normal unit-test runner;
+            // it only performs the competing open in the spawned child.
+            return;
+        };
+        let error = InboundJournal::open(PathBuf::from(root), 1024, 512)
+            .await
+            .expect_err("child must not open a journal owned by another process");
+        assert!(
+            error
+                .to_string()
+                .contains("already owned by another receiver"),
+            "expected explicit owner-lock contention; got {error}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn owner_lock_refuses_preexisting_symlink() {
