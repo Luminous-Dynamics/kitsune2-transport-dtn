@@ -10,7 +10,6 @@ use kitsune2_api::{K2Error, K2Result};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 
@@ -48,7 +47,7 @@ pub(crate) struct InboundJournal {
     max_record_bytes: usize,
     // Intentionally retained for the journal's full lifetime. The OS releases
     // the exclusive lock when the last handle is dropped, including crashes.
-    _owner_lock: Arc<File>,
+    _owner_lock: File,
 }
 
 impl InboundJournal {
@@ -469,7 +468,7 @@ fn checksum32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-async fn acquire_owner_lock(root: &Path) -> K2Result<Arc<File>> {
+async fn acquire_owner_lock(root: &Path) -> K2Result<File> {
     let path = root.join(".owner.lock");
 
     // A pre-existing symlink or special file is ambiguous ownership state.
@@ -552,7 +551,7 @@ async fn acquire_owner_lock(root: &Path) -> K2Result<Arc<File>> {
             )
         })?;
 
-    Ok(Arc::new(file))
+    Ok(file)
 }
 
 async fn path_exists(path: &Path) -> K2Result<bool> {
