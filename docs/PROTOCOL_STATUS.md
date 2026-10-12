@@ -11,6 +11,7 @@ This crate is a research transport bridge, not yet a drop-in replacement for Kit
 - Pending journal records are replayed in deterministic local storage order after restart and before further destructive endpoint polls.
 - A blocked pending record applies backpressure: the receiver does not destructively pop a newer bundle until the older record dispatches and its journal entry is durably removed.
 - Journal records are bounded, length-checked, protected with a local accidental-corruption checksum, and permission-hardened to `0700` directories / `0600` files on Unix.
+- Each journal root is exclusively locked for the full journal lifetime before endpoint registration; competing transport instances fail closed. This coordination relies on supported OS/filesystem lock semantics and is not a tamper-resistance boundary against the local host administrator.
 - Real-daemon scenarios have demonstrated delayed store-and-forward delivery, simultaneous bidirectional traffic, unordered complete delivery in the tested runs, and byte-identical payloads through 5 MB.
 
 ## Receive durability boundary

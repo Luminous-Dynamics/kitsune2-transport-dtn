@@ -7,6 +7,7 @@
 
 use bytes::Bytes;
 use kitsune2_api::{K2Error, K2Result};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,11 +40,14 @@ impl JournaledBundle {
 
 /// Bounded durable queue of bundles already removed from dtn7 but not yet
 /// acknowledged as successfully dispatched to Kitsune2.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct InboundJournal {
     root: PathBuf,
     max_pending_bytes: u64,
     max_record_bytes: usize,
+    // Intentionally retained for the journal's full lifetime. The OS releases
+    // the exclusive lock when the last handle is dropped, including crashes.
+    _owner_lock: File,
 }
 
 impl InboundJournal {
@@ -80,11 +84,15 @@ impl InboundJournal {
             ));
         }
         set_private_directory_permissions(&root).await?;
+        // Acquire exclusive ownership before recovery and, critically, before
+        // the caller registers the daemon's destructive receive endpoint.
+        let owner_lock = acquire_owner_lock(&root).await?;
 
         let journal = Self {
             root,
             max_pending_bytes,
             max_record_bytes,
+            _owner_lock: owner_lock,
         };
         journal.recover_complete_temps().await?;
 
@@ -460,6 +468,92 @@ fn checksum32(bytes: &[u8]) -> u32 {
     !crc
 }
 
+async fn acquire_owner_lock(root: &Path) -> K2Result<File> {
+    let path = root.join(".owner.lock");
+
+    // A pre-existing symlink or special file is ambiguous ownership state.
+    // The journal directory is private (0700 on Unix), which also limits
+    // interference between users. Re-check after opening to catch replacement
+    // and compare inode identity on Unix before acquiring the lock.
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(K2Error::other(
+                "dtn inbound journal owner lock is not a regular file",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(K2Error::other_src(
+                "failed to inspect dtn inbound journal owner lock",
+                error,
+            ));
+        }
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path).map_err(|error| {
+        K2Error::other_src("failed to open dtn inbound journal owner lock", error)
+    })?;
+
+    let path_metadata = tokio::fs::symlink_metadata(&path).await.map_err(|error| {
+        K2Error::other_src("failed to re-inspect dtn inbound journal owner lock", error)
+    })?;
+    let file_metadata = file.metadata().map_err(|error| {
+        K2Error::other_src("failed to stat opened dtn inbound journal owner lock", error)
+    })?;
+    if !path_metadata.file_type().is_file() || !file_metadata.is_file() {
+        return Err(K2Error::other(
+            "dtn inbound journal owner lock is not a regular file",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino()
+        {
+            return Err(K2Error::other(
+                "dtn inbound journal owner lock changed while opening",
+            ));
+        }
+    }
+
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(K2Error::other(
+                "dtn inbound journal is already owned by another receiver",
+            ));
+        }
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(K2Error::other_src(
+                "failed to acquire dtn inbound journal owner lock",
+                error,
+            ));
+        }
+    }
+
+    // Only the process that has acquired exclusive ownership may normalize
+    // metadata on a pre-existing lock file.
+    #[cfg(unix)]
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| {
+            K2Error::other_src(
+                "failed to protect dtn inbound journal owner lock",
+                error,
+            )
+        })?;
+
+    Ok(file)
+}
+
 async fn path_exists(path: &Path) -> K2Result<bool> {
     match tokio::fs::symlink_metadata(path).await {
         Ok(_) => Ok(true),
@@ -536,6 +630,100 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn exclusive_owner_lock_rejects_second_opener_and_releases_on_drop() {
+        let root = test_root("owner-lock");
+        let first = InboundJournal::open(root.clone(), 1024, 512)
+            .await
+            .expect("first owner should open journal");
+
+        let second_error = InboundJournal::open(root.clone(), 1024, 512)
+            .await
+            .expect_err("a second receiver must not open the same journal root");
+        assert!(
+            second_error
+                .to_string()
+                .contains("already owned by another receiver"),
+            "expected explicit owner-lock contention; got {second_error}"
+        );
+
+        drop(first);
+        let next = InboundJournal::open(root.clone(), 1024, 512)
+            .await
+            .expect("lock should be released when previous owner drops");
+        drop(next);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn owner_lock_is_enforced_across_processes() {
+        let root = test_root("owner-lock-subprocess");
+        let first = InboundJournal::open(root.clone(), 1024, 512)
+            .await
+            .expect("parent should own journal");
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "journal::tests::owner_lock_child_process_probe",
+                "--nocapture",
+            ])
+            .env("KITSUNE2_DTN_OWNER_LOCK_TEST_ROOT", &root)
+            .output()
+            .expect("spawn child test process");
+        assert!(
+            output.status.success(),
+            "child lock probe failed; stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "child test harness did not execute the lock probe: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        drop(first);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn owner_lock_child_process_probe() {
+        let Some(root) = std::env::var_os("KITSUNE2_DTN_OWNER_LOCK_TEST_ROOT") else {
+            // This probe is also discovered by the normal unit-test runner;
+            // it only performs the competing open in the spawned child.
+            return;
+        };
+        let error = InboundJournal::open(PathBuf::from(root), 1024, 512)
+            .await
+            .expect_err("child must not open a journal owned by another process");
+        assert!(
+            error
+                .to_string()
+                .contains("already owned by another receiver"),
+            "expected explicit owner-lock contention; got {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owner_lock_refuses_preexisting_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("owner-lock-symlink");
+        let target = test_root("owner-lock-target");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(&target, b"").expect("create lock target");
+        symlink(&target, root.join(".owner.lock")).expect("create malicious lock symlink");
+
+        let result = InboundJournal::open(root.clone(), 1024, 512).await;
+        assert!(result.is_err(), "symlinked owner lock must fail closed");
+        assert_eq!(std::fs::read(&target).unwrap(), b"");
+
+        std::fs::remove_dir_all(root).expect("cleanup root");
+        std::fs::remove_file(target).expect("cleanup target");
+    }
+
     #[test]
     fn checksum_has_known_ieee_vector() {
         assert_eq!(checksum32(b"123456789"), 0xcbf4_3926);
@@ -559,6 +747,7 @@ mod tests {
         assert_eq!(reopened.read(&pending[0]).await.unwrap(), raw);
         reopened.mark_delivered(&pending[0]).await.unwrap();
         assert!(reopened.pending().await.unwrap().is_empty());
+        drop(reopened);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -571,6 +760,7 @@ mod tests {
         let second = journal.persist(&raw).await.unwrap();
         assert_ne!(first.path(), second.path());
         assert_eq!(journal.pending().await.unwrap().len(), 2);
+        drop(journal);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -583,6 +773,7 @@ mod tests {
             .await
             .unwrap();
         assert!(journal.persist(&Bytes::from_static(b"x")).await.is_err());
+        drop(journal);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -604,6 +795,7 @@ mod tests {
             journal.read(&pending[0]).await.unwrap(),
             Bytes::from_static(raw)
         );
+        drop(journal);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -629,6 +821,7 @@ mod tests {
         std::fs::write(record.path(), b"abcdeg").unwrap();
         assert!(journal.read(&record).await.is_err());
         assert!(record.path().exists(), "corrupt record must be retained");
+        drop(journal);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -668,8 +861,15 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
+        let lock_mode = std::fs::metadata(root.join(".owner.lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
+        assert_eq!(lock_mode, 0o600);
+        drop(journal);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 }
