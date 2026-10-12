@@ -1,0 +1,74 @@
+; Proposed Luminous DTN Envelope v1.
+; DRAFT ONLY: not yet implemented or an interoperability commitment.
+; See DTN_ENVELOPE_V1.md for semantic and state-transition requirements.
+;
+; RFC 8949 core deterministic CBOR is required for protected headers and
+; signed payloads. Reject duplicate keys, indefinite-length items, unknown
+; fields, and trailing bytes in this profile.
+
+envelope-cose = #6.18([
+  protected: bstr .cbor envelope-protected-header,
+  unprotected: {},
+  payload: bstr .cbor envelope-v1,
+  signature: bstr .size 64
+])
+
+envelope-protected-header = {
+  1: -8, ; alg = EdDSA; v1 profile accepts Ed25519 keys only
+  3: "application/vnd.luminous.dtn-envelope-v1+cbor",
+  4: bstr .size 32 ; kid, resolved by the local credential/trust store
+}
+
+envelope-v1 = {
+  1: 1, ; version
+  2: bstr .size 16, ; message_id, generated once and stable across retries
+  3: bstr .size 32, ; sender_id, opaque canonical principal identifier
+  4: uint, ; created_at_ms, sender-asserted Unix epoch milliseconds
+  5: uint, ; expires_at_ms, absolute Unix epoch milliseconds
+  6: 0..3, ; traffic_class: 0 ephemeral, 1 durable, 2 bulk, 3 control
+  7: tstr .size (1..127), ; payload_type, lowercase ASCII media type
+  8: bstr, ; payload bytes, bounded by raw envelope cap
+  9: bstr .size 32 ; SHA-256(payload bytes)
+}
+
+receipt-cose = #6.18([
+  protected: bstr .cbor receipt-protected-header,
+  unprotected: {},
+  payload: bstr .cbor receipt-v1,
+  signature: bstr .size 64
+])
+
+receipt-protected-header = {
+  1: -8, ; alg = EdDSA; v1 profile accepts Ed25519 keys only
+  3: "application/vnd.luminous.dtn-receipt-v1+cbor",
+  4: bstr .size 32 ; receiver credential identifier
+}
+
+receipt-v1 = {
+  1: 1, ; version
+  2: bstr .size 16, ; receipt_id, generated once per persisted transition
+  3: bstr .size 16, ; original message_id
+  4: bstr .size 32, ; envelope_digest = SHA-256(exact envelope payload CBOR bytes)
+  5: bstr .size 32, ; receiver_id
+  6: 0..4, ; 0 inbox_committed, 1 handler_accepted, 2 app_committed,
+            ; 3 rejected, 4 expired
+  7: uint / null, ; receiver observed time (null when trusted time unavailable)
+  8: 0..10 ; stable reason code; 0 means no error
+}
+
+; Stable proposed reason codes:
+; 0 none
+; 1 malformed_envelope
+; 2 unsupported_version_or_field
+; 3 unknown_or_untrusted_credential
+; 4 sender_binding_mismatch
+; 5 payload_digest_mismatch
+; 6 expired_or_invalid_time
+; 7 traffic_class_not_allowed
+; 8 message_id_conflict
+; 9 resource_limit
+; 10 application_unauthorized
+;
+; Receipt disposition 2 (app_committed) is reserved for a higher layer with a
+; defined durable application transaction/idempotency contract. The current
+; Kitsune2 transport adapter must not emit it.
